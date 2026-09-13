@@ -16,18 +16,32 @@ pub fn similarity(a: &[String], b: &[String]) -> f64 {
     shared as f64 / union as f64
 }
 
-/// Stable identifier for a story: its whole sorted, deduplicated token set.
+/// Stable identifier for a story: its whole sorted, deduplicated token set, joined by `-`.
 ///
-/// Truncating would collide — two groups below the threshold can share a prefix and differ
-/// later — and Task 12 keys rank deltas on this string, where a collision means both stories
-/// report the wrong movement. Distinct groups necessarily have distinct token sets (identical
-/// sets score 1.0 and would have merged), so the full set is collision-free by construction
-/// while staying stable across polls.
+/// `tokens` only ever yields alphanumeric runs, so no token contains `-` and the join is
+/// injective: distinct token sets always produce distinct keys. Distinct groups have distinct
+/// token sets anyway — identical sets score 1.0 and would have merged — but the injectivity is
+/// what makes the guarantee hold without leaning on the grouping rule. Task 12 keys rank deltas
+/// on this string, where a collision means both stories report the wrong movement.
+///
+/// An empty set returns `""`. Callers that need one identity per untokenized item must not use
+/// this; [`Group::new`] keys those by row id instead.
 pub fn signature(tokens: &[String]) -> String {
-    if tokens.is_empty() {
-        return "empty".to_string();
-    }
     tokens.join("-")
+}
+
+/// Key for a group that a new item starts: its signature, or a row-id key when the title yields
+/// no tokens. An untokenized item can never match anything at a positive threshold, so each one
+/// becomes its own group; keying them all `""` would collide and Task 12 would overwrite one
+/// story's rank delta with another's. `item_id` is the database row id, stable across polls
+/// because items are upserted rather than re-inserted. The `:` prefix is unreachable from
+/// `signature`, which only ever joins alphanumeric tokens.
+fn group_key(item: &ItemRow, tokens: &[String]) -> String {
+    if tokens.is_empty() {
+        format!("untokenized:{}", item.item_id)
+    } else {
+        signature(tokens)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +58,7 @@ pub struct Group {
 impl Group {
     fn new(item: &ItemRow, tokens: Vec<String>) -> Self {
         Self {
-            key: signature(&tokens),
+            key: group_key(item, &tokens),
             title: item.title.clone(),
             tokens,
             item_ids: vec![item.item_id],
@@ -62,12 +76,25 @@ impl Group {
     }
 }
 
+/// Similarity threshold a caller's non-finite value falls back to.
+const DEFAULT_THRESHOLD: f64 = 0.45;
+
 pub struct Clusterer {
     threshold: f64,
 }
 
 impl Clusterer {
+    /// Clamp the threshold into its meaningful range. Above 1.0 nothing can ever match —
+    /// similarity tops out at 1.0 — so identical headlines would stay in separate groups and
+    /// hand Task 12 duplicate keys. `f64::clamp` alone does not catch NaN
+    /// (`f64::NAN.clamp(0.0, 1.0)` is NaN, and every comparison against it is false), so
+    /// non-finite values take `DEFAULT_THRESHOLD`.
     pub fn new(threshold: f64) -> Self {
+        let threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_THRESHOLD
+        };
         Self { threshold }
     }
 
@@ -251,7 +278,7 @@ mod tests {
     fn signature_is_stable_and_collision_free() {
         let tokens = vec!["a".to_string(), "b".to_string()];
         assert_eq!(signature(&tokens), "a-b");
-        assert_eq!(signature(&[]), "empty");
+        assert_eq!(signature(&[]), "");
 
         let long = |last: &str| -> Vec<String> {
             ["a", "b", "c", "d", "e", "f", last].iter().map(|s| s.to_string()).collect()
@@ -261,5 +288,56 @@ mod tests {
             signature(&long("h")),
             "keys that differ only after the sixth token must not collide"
         );
+        assert_ne!(
+            signature(&[]),
+            signature(&["empty".to_string()]),
+            "an untokenized set must not collide with a title that contains the token `empty`"
+        );
+    }
+
+    #[test]
+    fn untokenized_titles_get_distinct_keys() {
+        let clusterer = Clusterer::new(0.45);
+        // Nothing here survives `tokens`: every word is under four characters or a stopword.
+        let items = vec![item(1, 1, "və bu il o", 100), item(2, 2, "olan ucun", 200)];
+
+        let groups = clusterer.group_items(&items);
+
+        assert_eq!(groups.len(), 2, "untokenized headlines can never match anything");
+        assert_eq!(groups[0].key, "untokenized:1");
+        assert_eq!(groups[1].key, "untokenized:2");
+        assert_ne!(groups[0].key, groups[1].key, "duplicate keys overwrite each other in Task 12");
+
+        let again = clusterer.group_items(&items);
+        assert_eq!(again[0].key, groups[0].key, "the key must not move between polls");
+    }
+
+    #[test]
+    fn an_impossible_threshold_is_clamped_into_range() {
+        let items = vec![
+            item(1, 1, "Bakıda bu yollar bağlıdır", 100),
+            item(2, 2, "Bakıda bu yollar bağlıdır", 200),
+        ];
+
+        let groups = Clusterer::new(5.0).group_items(&items);
+
+        assert_eq!(groups.len(), 1, "5.0 clamps to 1.0, so identical headlines still merge");
+    }
+
+    #[test]
+    fn a_nan_threshold_falls_back_to_the_default() {
+        let identical = vec![
+            item(1, 1, "Bakıda bu yollar bağlıdır", 100),
+            item(2, 2, "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə", 200),
+        ];
+        let unrelated = vec![
+            item(1, 1, "Gəncədə iki nəfər bıçaqlandı", 100),
+            item(2, 2, "Gəncədə toy karvanı qəza etdi", 200),
+        ];
+
+        // 0.6 joins and 0.167 stays apart only at the default 0.45: a NaN threshold would put
+        // every item in its own group, and 0.0 would merge both pairs.
+        assert_eq!(Clusterer::new(f64::NAN).group_items(&identical).len(), 1);
+        assert_eq!(Clusterer::new(f64::NAN).group_items(&unrelated).len(), 2);
     }
 }
