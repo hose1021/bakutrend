@@ -85,9 +85,8 @@ fn item_publishers(xml: &str) -> BTreeMap<String, String> {
 /// dropped, then entities are decoded. The publisher name must come out as plain text, or one
 /// outlet arrives in the store as two.
 fn element_text(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}");
-    let start = xml.find(&open)? + open.len();
-    let start = xml[start..].find('>')? + start + 1;
+    let open = xml.find(&format!("<{tag}"))?;
+    let start = tag_end(xml, open)?;
     let end = xml[start..].find(&format!("</{tag}>"))? + start;
     let inner = xml[start..end].trim();
     let inner = inner
@@ -103,13 +102,28 @@ fn strip_tags(input: &str) -> String {
     let mut rest = input;
     while let Some(open) = rest.find('<') {
         out.push_str(&rest[..open]);
-        match rest[open..].find('>') {
-            Some(close) => rest = &rest[open + close + 1..],
-            None => return out,
-        }
+        let Some(end) = tag_end(rest, open) else { return out };
+        rest = &rest[end..];
     }
     out.push_str(rest);
     out
+}
+
+/// Index just past the `>` closing the tag that starts at `open`. A `>` inside a quoted attribute
+/// value belongs to the attribute, not the tag. `None` when the tag never closes, so callers can
+/// drop the partial markup instead of letting it through as an outlet name.
+fn tag_end(input: &str, open: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, ch) in input[open..].char_indices() {
+        match (quote, ch) {
+            (Some(open_quote), c) if c == open_quote => quote = None,
+            (Some(_), _) => {}
+            (None, c @ ('"' | '\'')) => quote = Some(c),
+            (None, '>') => return Some(open + offset + 1),
+            (None, _) => {}
+        }
+    }
+    None
 }
 
 /// Remove a trailing ` - Publisher`. `<source>` is the ground truth, so try it first with the
@@ -221,6 +235,32 @@ mod tests {
         <source url="https://www.day.az"><![CDATA[Day.Az]]></source></item></channel></rss>"#;
         let out = parse(xml.as_bytes()).expect("parses");
         assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
+    }
+
+    /// A `>` inside a quoted attribute value belongs to the attribute. Closing the tag there would
+    /// leave `b">Day.Az` as the publisher, and a corrupted name splits one outlet into two.
+    #[test]
+    fn a_tag_whose_attribute_contains_a_gt_does_not_leak_markup() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item><title>Bakıda yollar bağlıdır - Day.Az</title>
+        <link>https://news.google.com/rss/articles/abc</link>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az"><b title="a > b">Day.Az</b></source></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
+        assert_eq!(out.items[0].title, "Bakıda yollar bağlıdır");
+    }
+
+    /// The tag never closes, so the text before it survives and the partial markup is dropped
+    /// rather than emitted as an outlet name. Untagged text passes through untouched.
+    #[test]
+    fn an_unterminated_tag_drops_the_partial_markup() {
+        assert_eq!(strip_tags("Day.Az<b"), "Day.Az");
+        assert_eq!(strip_tags("Day.Az<b title=\"unclosed"), "Day.Az");
+        // The `>` here is inside the quotes, and the tag never closes: neither may end it.
+        assert_eq!(strip_tags("Day.Az<b title=\"a > b"), "Day.Az");
+        assert_eq!(strip_tags("APA"), "APA");
+        assert_eq!(strip_tags("Day &amp; Az"), "Day &amp; Az");
     }
 
     #[test]
