@@ -3132,7 +3132,7 @@ git commit -m "feat: blocking HTTP fetcher, Telegram empty-preview detection, Go
 
 **Interfaces:**
 - Consumes: `crate::source::{Fetcher, ParseOutcome}`, `crate::store::Store`, `crate::cluster::Clusterer`, `crate::score::rank`.
-- Produces: `crate::poller::{Backoff, PollReport, poll_once, fetch_google_seed}`.
+- Produces: `crate::poller::{Backoff, PollReport, poll_once}`.
   - `poll_once(&mut Store, &dyn Fetcher, &mut Backoff, now: i64, retention_days: i64) -> Result<PollReport, StoreError>`
   - `PollReport { ok, failed: Vec<(String, String)>, new_items, samples, pruned, skipped }`
   - `Backoff::is_due(&self, source_id: i64, now: i64) -> bool`, `record_ok`, `record_failure`
@@ -3215,7 +3215,7 @@ mod tests {
         assert!(!backoff.is_due(1, now + 30), "not due immediately after a failure");
         assert!(backoff.is_due(1, now + 61), "due after the first backoff interval");
 
-        for step in 1..12 {
+        for step in 1..=12 {
             backoff.record_failure(1, now + step * 3600);
         }
         assert!(!backoff.is_due(1, now + 12 * 3600 + 1700), "never exceeds the 30 minute cap");
