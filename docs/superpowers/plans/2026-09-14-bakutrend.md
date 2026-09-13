@@ -688,10 +688,11 @@ git commit -m "feat: parse RSS feeds with link-based identity and entity decodin
 UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'
 curl -sSL -A "$UA" https://t.me/s/qafqazinfo   -o tests/fixtures/qafqazinfo.tg.html
 curl -sSL -A "$UA" https://t.me/s/bakupost     -o tests/fixtures/bakupost.tg.html
-curl -sSL -A "$UA" https://t.me/s/apa_az       -o tests/fixtures/apa_az.tg.html
-curl -sSL -A "$UA" https://t.me/s/apatv        -o tests/fixtures/apatv_empty.tg.html
 wc -c tests/fixtures/*.tg.html
 ```
+
+Note there is deliberately no fixture for the empty-preview case: that test uses an inline
+page so it cannot break when a channel changes its behaviour.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -729,32 +730,69 @@ mod tests {
         }
     }
 
+    /// A hand-written page, not a capture. These assert exact semantics, so they must not
+    /// depend on whichever posts the live channels happened to serve at capture time.
+    const INLINE: &str = r#"<html><body>
+      <div class="tgme_widget_message" data-post="chan/1">
+        <a class="tgme_widget_message_date" href="https://t.me/chan/1">
+          <time datetime="2026-09-13T19:06:15+00:00"></time></a>
+        <div class="tgme_widget_message_text js-message_text" dir="auto">
+          <b>İsmayıllıda maşın aşıb yandı - Sürücü yaralandı<br/><br/></b>
+          Ətraflı: <a href="https://example.az/news/detail/x-1">link</a></div>
+        <span class="tgme_widget_message_views">2.65K</span>
+      </div>
+      <div class="tgme_widget_message" data-post="chan/2">
+        <a class="tgme_widget_message_date" href="https://t.me/chan/2">
+          <time datetime="2026-09-13T20:06:15+00:00"></time></a>
+        <div class="tgme_widget_message_text js-message_text" dir="auto">
+          <i class="emoji"><b>🇷🇺</b></i> <b>Peskov: müzakirələr davam edir</b><br/><br/>Bakıda görüş keçirildi.</div>
+        <span class="tgme_widget_message_views">1.1K</span>
+      </div>
+    </body></html>"#;
+
     #[test]
-    fn title_is_the_first_line_not_the_whole_post() {
-        let out = parse(&fixture("bakupost.tg.html"));
-        let item = out.items.first().expect("at least one post");
-        // The captured post is "40 yaşlı Ledi Qaqa ilk dəfə ana olub<br/><br/>40 yaşlı müğənni ...".
-        assert_eq!(item.title, "40 yaşlı Ledi Qaqa ilk dəfə ana olub");
-        assert!(item.description.as_deref().is_some_and(|d| d.len() > item.title.len()));
+    fn the_title_is_the_first_line_not_the_whole_post() {
+        let out = parse(INLINE);
+        assert_eq!(out.items[0].title, "İsmayıllıda maşın aşıb yandı - Sürücü yaralandı");
+        assert!(out.items[0].description.as_deref().is_some_and(|d| d.contains("Ətraflı")));
     }
 
     #[test]
-    fn emoji_prefixed_bold_titles_are_kept_intact() {
-        // apa_az posts start with an emoji <i> element, then the <b> headline.
-        let out = parse(&fixture("apa_az.tg.html"));
-        assert!(out.items.len() >= 10);
-        assert!(
-            out.items.iter().any(|i| i.title.contains("Peskov")),
-            "expected the Peskov headline among: {:?}",
-            out.items.iter().map(|i| &i.title).collect::<Vec<_>>()
-        );
+    fn an_emoji_prefix_does_not_swallow_the_headline() {
+        let out = parse(INLINE);
+        assert_eq!(out.items[1].title, "🇷🇺 Peskov: müzakirələr davam edir");
     }
 
     #[test]
-    fn a_preview_with_no_posts_yields_no_items() {
-        let out = parse(&fixture("apatv_empty.tg.html"));
+    fn identity_time_and_views_come_from_the_post_attributes() {
+        let out = parse(INLINE);
+        assert_eq!(out.items[0].external_id, "chan/1");
+        assert_eq!(out.items[0].url, "https://t.me/chan/1");
+        assert_eq!(out.items[0].views, Some(2650));
+        assert_eq!(out.items[1].views, Some(1100));
+    }
+
+    #[test]
+    fn a_page_with_no_post_containers_yields_no_items_and_no_skips() {
+        let out = parse("<html><body><div class=\"tgme_channel_info\">previews off</div></body></html>");
         assert!(out.items.is_empty());
         assert_eq!(out.skipped, 0);
+    }
+
+    #[test]
+    fn captured_pages_still_parse_with_titles_shorter_than_bodies() {
+        // Non-brittle check on real bytes: the live feed picks the words, this test only
+        // asserts the invariant that must hold whatever it published.
+        let out = parse(&fixture("bakupost.tg.html"));
+        assert!(out.items.len() >= 5, "got {} posts", out.items.len());
+        for item in &out.items {
+            assert!(!item.title.contains("<br"), "raw markup leaked into {:?}", item.title);
+            assert!(
+                item.description.as_deref().is_some_and(|d| d.len() >= item.title.len()),
+                "title must not be longer than the body for post {:?}",
+                item.external_id
+            );
+        }
     }
 }
 ```
@@ -869,7 +907,7 @@ pub fn parse(html: &str) -> ParseOutcome {
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `cargo test --lib source::telegram 2>&1 | tail -30`
-Expected: PASS, 5 tests.
+Expected: PASS, 6 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -2801,7 +2839,7 @@ Expected: PASS, 2 tests.
 
 use std::time::Duration;
 
-use crate::error::{FetchError, ParseError};
+use crate::error::FetchError;
 use crate::source::{self, ParseOutcome, SourceKind};
 use crate::store::SourceRow;
 
@@ -3301,7 +3339,9 @@ fn one_poll_ingests_every_source_and_produces_a_ranked_list() {
 
     let groups = Clusterer::new(0.45).group_items(&items);
     assert!(!groups.is_empty());
-    assert!(groups.len() < items.len(), "some real headlines must merge into shared stories");
+    // Grouping never invents stories. Whether real headlines happen to merge is not an
+    // invariant of this test — Task 6 pins that behaviour deterministically.
+    assert!(groups.len() <= items.len());
 
     let ranked = rank(&groups, &samples, Window::Week, &Weights::default(), now);
     assert!(!ranked.is_empty());
@@ -3956,7 +3996,7 @@ use crate::poller::PollReport;
 use crate::score::{rank, ScoredStory};
 use crate::store::{Store, Window};
 use crate::text::matches_any;
-use crate::ui::{self, View};
+use crate::ui::View;
 
 /// Below this many stories, the active window is treated as quiet and the list falls
 /// back to the latest stories under a visible banner.
