@@ -2406,6 +2406,16 @@ pub fn rank(
 }
 ```
 
+**Shipped shape (post-review).** The snippet above is correct but scores slowly: each item called
+`views_per_hour`, which scans and sorts the whole sample slice, three times per item. On a week
+window that is ~1,400 Telegram items against ~10^5 samples, measured at 1.87 s in an unoptimized
+build. The shipped `score.rs` instead indexes the samples ONCE per `rank` call (grouped by
+`item_id`, each bucket sorted once), computes each item's rate exactly once, and reuses that single
+value for both the engagement total and the `OutletContribution`. The public `views_per_hour`
+signature is unchanged and delegates to the same per-item computation, so the two paths cannot
+disagree. That measured 39.8 ms for the same volume — a 47x difference on a path that runs on
+every poll completion and every window switch.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --lib score:: 2>&1 | tail -30`
