@@ -7,3 +7,4 @@ pub mod score;
 pub mod source;
 pub mod store;
 pub mod text;
+pub mod ui;
