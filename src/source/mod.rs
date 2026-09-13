@@ -63,8 +63,9 @@ pub struct SourceSpec {
 /// First path segment of a URL, used as a section slug. Returns `None` for a bare host.
 pub fn section_from_url(url: &str) -> Option<String> {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
     let path = rest.split_once('/').map(|(_, r)| r)?;
-    let segment = path.split(['/', '?', '#']).next()?;
+    let segment = path.split('/').next()?;
     if segment.is_empty() {
         None
     } else {
@@ -72,12 +73,49 @@ pub fn section_from_url(url: &str) -> Option<String> {
     }
 }
 
-const CITATION_MARKERS: &[&str] = &[
-    "istinaden", "istinadla", "melumatina gore", "сообщает", "передает", "ссылаясь", "по данным",
+/// Each marker is its own token sequence, so `istinadlar` is not `istinadla`.
+const CITATION_MARKERS: &[&[&str]] = &[
+    &["istinaden"],
+    &["istinadla"],
+    &["melumatina", "gore"],
+    &["сообщает"],
+    &["передает"],
+    &["ссылаясь"],
+    &["по", "данным"],
 ];
 
 /// True when the text credits another outlet. Such an item weighs half in coverage.
 pub fn is_cited(text: &str) -> bool {
     let folded = text::fold(text);
-    CITATION_MARKERS.iter().any(|marker| folded.contains(marker))
+    let words: Vec<&str> = folded
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    CITATION_MARKERS
+        .iter()
+        .any(|marker| words.windows(marker.len()).any(|run| run == *marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_cited_matches_whole_tokens_only() {
+        assert!(is_cited("“Qafqazinfo” APA-ya istinadən xəbər verir ki, hadisə olub"));
+        assert!(is_cited("TASS-a istinadla məlumat yayılıb"));
+        assert!(is_cited("Məlumatına görə, hadisə gecə baş verib"));
+        assert!(!is_cited("Bakıda bu yollar bağlıdır"));
+        assert!(!is_cited("İstinadlar göstərilib"));
+        assert!(!is_cited("Он сообщается в отчёте"));
+    }
+
+    #[test]
+    fn section_from_url_ignores_query_and_fragment() {
+        assert_eq!(section_from_url("https://host?next=/foo"), None);
+        assert_eq!(section_from_url("https://host/path?x=1").as_deref(), Some("path"));
+        assert_eq!(section_from_url("https://host/path#frag").as_deref(), Some("path"));
+        assert_eq!(section_from_url("https://host"), None);
+        assert_eq!(section_from_url("https://azertag.az/"), None);
+    }
 }
