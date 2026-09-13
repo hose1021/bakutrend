@@ -2819,12 +2819,19 @@ Expected: FAIL — `cannot find function parse in this scope`.
 //! Google News RSS, used only to seed the week window on an empty database.
 //! Titles arrive as `Headline - Publisher`, and the RSS `<source>` element names the publisher.
 
+use std::collections::BTreeMap;
+
 use crate::error::ParseError;
 use crate::source::{is_cited, section_from_url, ParseOutcome, ParsedItem};
 use crate::text::{collapse_ws, decode_entities};
 
 pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
     let feed = feed_rs::parser::parse(bytes).map_err(|e| ParseError::Feed(e.to_string()))?;
+    // `feed-rs` 2.4.0 drops the RSS `<source>` element — its `Entry::source` is Atom-only — so
+    // the publisher names come from the raw XML, keyed by the item's own link rather than by
+    // position. Without the name there is nothing to strip the title suffix against, and the
+    // store would credit the seed source instead of the real outlet.
+    let publishers = item_publishers(&String::from_utf8_lossy(bytes));
     let mut outcome = ParseOutcome::default();
     for entry in feed.entries {
         let Some(url) = entry.links.first().map(|link| link.href.clone()) else {
@@ -2835,10 +2842,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
             .title
             .map(|t| collapse_ws(&decode_entities(&t.content)))
             .unwrap_or_default();
-        let publisher = entry
-            .source
-            .map(|s| collapse_ws(&decode_entities(&s)))
-            .filter(|s| !s.is_empty());
+        let publisher = publishers.get(&url).cloned().filter(|name| !name.is_empty());
         let title = strip_publisher_suffix(&raw_title, publisher.as_deref());
         if title.is_empty() {
             outcome.skipped += 1;
@@ -2866,8 +2870,81 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
     Ok(outcome)
 }
 
-/// Remove a trailing ` - Publisher`. Without a known publisher, take the last ` - ` segment
-/// off when it looks like a site name (no spaces beyond one, ends in a TLD-ish token).
+/// Map each item's `<link>` text to its `<source>` text, in one pass over the raw XML.
+///
+/// A positional walk would credit one story's publisher to another as soon as the scan's block
+/// count differs from `feed.entries` — an `<item>` carrying attributes, a missing `<source>`, or
+/// a block with no matching entry. Links are unique per item, so keying on the link stays exact.
+fn item_publishers(xml: &str) -> BTreeMap<String, String> {
+    let mut publishers = BTreeMap::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<item") {
+        let after_name = &rest[start + "<item".len()..];
+        // `<items>` and the like are not items; a real tag continues with `>`, `/` or a space.
+        if !after_name.starts_with(['>', '/']) && !after_name.starts_with(char::is_whitespace) {
+            rest = after_name;
+            continue;
+        }
+        let block = &rest[start..];
+        let Some(end) = block.find("</item>") else { break };
+        let block = &block[..end];
+        if let (Some(link), Some(source)) =
+            (element_text(block, "link"), element_text(block, "source"))
+        {
+            publishers.insert(link, source);
+        }
+        rest = &rest[start + end..];
+    }
+    publishers
+}
+
+/// Inner text of the first `<tag ...>…</tag>` in `xml`: a CDATA wrapper and any nested markup are
+/// dropped, then entities are decoded. The publisher name must come out as plain text, or one
+/// outlet arrives in the store as two.
+fn element_text(xml: &str, tag: &str) -> Option<String> {
+    let open = xml.find(&format!("<{tag}"))?;
+    let start = tag_end(xml, open)?;
+    let end = xml[start..].find(&format!("</{tag}>"))? + start;
+    let inner = xml[start..end].trim();
+    let inner = inner
+        .strip_prefix("<![CDATA[")
+        .and_then(|text| text.strip_suffix("]]>"))
+        .unwrap_or(inner);
+    Some(decode_entities(&strip_tags(inner)).trim().to_string())
+}
+
+/// Drop `<…>` markup, keeping the text between the tags.
+fn strip_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let Some(end) = tag_end(rest, open) else { return out };
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Index just past the `>` closing the tag that starts at `open`. A `>` inside a quoted attribute
+/// value belongs to the attribute, not the tag. `None` when the tag never closes, so callers drop
+/// the partial markup instead of letting it through as an outlet name.
+fn tag_end(input: &str, open: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, ch) in input[open..].char_indices() {
+        match (quote, ch) {
+            (Some(open_quote), c) if c == open_quote => quote = None,
+            (Some(_), _) => {}
+            (None, c @ ('"' | '\'')) => quote = Some(c),
+            (None, '>') => return Some(open + offset + 1),
+            (None, _) => {}
+        }
+    }
+    None
+}
+
+/// Remove a trailing ` - Publisher`. `<source>` is the ground truth, so try it first with the
+/// separators Google emits; only guess a tail when there is no publisher to match.
 fn strip_publisher_suffix(title: &str, publisher: Option<&str>) -> String {
     if let Some(publisher) = publisher {
         for separator in [" - ", " — ", " | "] {
@@ -2912,6 +2989,19 @@ const USER_AGENT: &str =
 /// implementation so the whole poll cycle runs offline.
 pub trait Fetcher {
     fn fetch(&self, source: &SourceRow) -> Result<ParseOutcome, FetchError>;
+}
+
+/// Telegram answers HTTP 200 even for a channel that disabled previews, with a page holding no
+/// post containers at all. Reporting that as "0 new items" would make a dead source look like a
+/// quiet channel, so it is `EmptyPreview`. Containers that all failed to PARSE are a different
+/// thing — a malformed or unsupported channel — and those skips are worth recording, so the gate
+/// is on `skipped == 0` as well. This lives in a pure function so the policy is testable without
+/// a live server.
+fn telegram_outcome(outcome: ParseOutcome, handle: &str) -> Result<ParseOutcome, FetchError> {
+    if outcome.items.is_empty() && outcome.skipped == 0 {
+        return Err(FetchError::EmptyPreview { handle: handle.to_string() });
+    }
+    Ok(outcome)
 }
 
 pub fn rss_url(locator: &str) -> String {
