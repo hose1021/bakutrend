@@ -8,9 +8,12 @@ use scraper::{Html, Selector};
 use crate::source::{section_from_url, ParseOutcome, ParsedItem};
 use crate::text::{collapse_ws, decode_entities};
 
-/// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number.
+/// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number, and groups
+/// thousands with a no-break space (`12 345`). A value that fails to parse would silently drop
+/// the post's engagement signal, so every kind of whitespace is stripped, not just the ends.
 pub fn parse_views(raw: &str) -> Option<i64> {
-    let cleaned = raw.trim().replace('\u{a0}', " ").replace(',', ".");
+    let cleaned = raw.replace(',', ".");
+    let cleaned = cleaned.split_whitespace().collect::<String>();
     if cleaned.is_empty() {
         return None;
     }
@@ -20,7 +23,6 @@ pub fn parse_views(raw: &str) -> Option<i64> {
         _ => (cleaned.as_str(), 1.0),
     };
     digits
-        .trim()
         .parse::<f64>()
         .ok()
         .map(|value| (value * multiplier).round() as i64)
@@ -29,7 +31,10 @@ pub fn parse_views(raw: &str) -> Option<i64> {
 pub fn parse(html: &str) -> ParseOutcome {
     // Static selectors: a failure here is a programming error, not a runtime condition.
     let post_selector = Selector::parse("div.tgme_widget_message").expect("static selector");
-    let time_selector = Selector::parse("time[datetime]").expect("static selector");
+    // The post timestamp is the footer anchor's `<time>`; an earlier `<time datetime>` elsewhere
+    // in the post (link preview, forwarded header) is not the post time.
+    let time_selector = Selector::parse("a.tgme_widget_message_date time[datetime]")
+        .expect("static selector");
     let views_selector = Selector::parse(".tgme_widget_message_views").expect("static selector");
     let text_selector = Selector::parse(".tgme_widget_message_text").expect("static selector");
     let link_selector = Selector::parse("a.tgme_widget_message_date").expect("static selector");
@@ -110,6 +115,8 @@ mod tests {
         assert_eq!(parse_views("1.1K"), Some(1100));
         assert_eq!(parse_views("340"), Some(340));
         assert_eq!(parse_views("1.2M"), Some(1_200_000));
+        assert_eq!(parse_views("12\u{a0}345"), Some(12_345));
+        assert_eq!(parse_views("453 000"), Some(453_000));
         assert_eq!(parse_views(""), None);
     }
 
@@ -167,6 +174,25 @@ mod tests {
         assert_eq!(out.items[0].url, "https://t.me/chan/1");
         assert_eq!(out.items[0].views, Some(2650));
         assert_eq!(out.items[1].views, Some(1100));
+    }
+
+    /// A post whose earlier markup also carries a `<time datetime>` — a link preview or a
+    /// forwarded-message header does this. The post time is the one in the date anchor.
+    const INLINE_EARLY_TIMESTAMP: &str = r#"<html><body>
+      <div class="tgme_widget_message" data-post="chan/3">
+        <div class="tgme_link_preview"><time datetime="1970-01-01T00:00:00+00:00"></time>preview</div>
+        <div class="tgme_widget_message_text js-message_text" dir="auto">Başlıq<br/><br/>Gövdə mətni</div>
+        <a class="tgme_widget_message_date" href="https://t.me/chan/3">
+          <time datetime="2026-09-13T19:06:15+00:00"></time></a>
+        <span class="tgme_widget_message_views">340</span>
+      </div>
+    </body></html>"#;
+
+    #[test]
+    fn the_timestamp_is_the_footer_anchor_not_an_earlier_element() {
+        let out = parse(INLINE_EARLY_TIMESTAMP);
+        assert_eq!(out.items.len(), 1, "got {} posts", out.items.len());
+        assert_eq!(out.items[0].published_at, 1_789_326_375);
     }
 
     #[test]
