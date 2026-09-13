@@ -1,6 +1,8 @@
 //! Google News RSS, used only to seed the week window on an empty database.
 //! Titles arrive as `Headline - Publisher`, and the RSS `<source>` element names the publisher.
 
+use std::collections::BTreeMap;
+
 use crate::error::ParseError;
 use crate::source::{is_cited, section_from_url, ParseOutcome, ParsedItem};
 use crate::text::{collapse_ws, decode_entities};
@@ -10,7 +12,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
     // `feed-rs` ignores the RSS `<source>` element, so the publisher names come from the raw XML.
     let publishers = item_publishers(&String::from_utf8_lossy(bytes));
     let mut outcome = ParseOutcome::default();
-    for (index, entry) in feed.entries.into_iter().enumerate() {
+    for entry in feed.entries {
         let Some(url) = entry.links.first().map(|link| link.href.clone()) else {
             outcome.skipped += 1;
             continue;
@@ -20,7 +22,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
             .map(|t| collapse_ws(&decode_entities(&t.content)))
             .unwrap_or_default();
         let publisher = publishers
-            .get(index)
+            .get(&url)
             .map(|name| collapse_ws(name))
             .filter(|name| !name.is_empty());
         let title = strip_publisher_suffix(&raw_title, publisher.as_deref());
@@ -50,29 +52,64 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
     Ok(outcome)
 }
 
-/// The `<source>` text of each item, in document order. `feed-rs` ignores the RSS `<source>`
-/// element, and without it there is nothing to strip the title suffix against and the store
-/// would credit the seed source instead of the real outlet. Google emits bare `<item>` tags and
-/// escapes any nested markup, so pairing positionally with `feed.entries` is exact.
-fn item_publishers(xml: &str) -> Vec<String> {
-    let mut publishers = Vec::new();
+/// Map each item's `<link>` to the text of that item's `<source>`. `feed-rs` ignores the RSS
+/// `<source>` element, and without it there is nothing to strip the title suffix against and the
+/// store would credit the seed source instead of the real outlet. Keying on the link rather than
+/// the item's position keeps attribution exact whatever the scan sees — attributes, a missing
+/// `<source>`, or a block with no matching entry — where a positional walk would credit one
+/// story's publisher to another.
+fn item_publishers(xml: &str) -> BTreeMap<String, String> {
+    let mut publishers = BTreeMap::new();
     let mut rest = xml;
-    while let Some(start) = rest.find("<item>") {
+    while let Some(start) = rest.find("<item") {
+        let after_name = &rest[start + "<item".len()..];
+        // `<items>` and the like are not items; a real tag continues with `>`, `/` or a space.
+        if !after_name.starts_with(['>', '/']) && !after_name.starts_with(char::is_whitespace) {
+            rest = after_name;
+            continue;
+        }
         let block = &rest[start..];
         let Some(end) = block.find("</item>") else { break };
-        publishers.push(element_text(&block[..end], "source").unwrap_or_default());
+        let block = &block[..end];
+        if let (Some(link), Some(source)) =
+            (element_text(block, "link"), element_text(block, "source"))
+        {
+            publishers.insert(link, source);
+        }
         rest = &rest[start + end..];
     }
     publishers
 }
 
-/// Inner text of the first `<tag ...>…</tag>` in `xml`, with entities decoded.
+/// Inner text of the first `<tag ...>…</tag>` in `xml`: a CDATA wrapper and any nested markup are
+/// dropped, then entities are decoded. The publisher name must come out as plain text, or one
+/// outlet arrives in the store as two.
 fn element_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let start = xml.find(&open)? + open.len();
     let start = xml[start..].find('>')? + start + 1;
     let end = xml[start..].find(&format!("</{tag}>"))? + start;
-    Some(decode_entities(&xml[start..end]))
+    let inner = xml[start..end].trim();
+    let inner = inner
+        .strip_prefix("<![CDATA[")
+        .and_then(|text| text.strip_suffix("]]>"))
+        .unwrap_or(inner);
+    Some(decode_entities(&strip_tags(inner)).trim().to_string())
+}
+
+/// Drop `<…>` markup, keeping the text between the tags.
+fn strip_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        match rest[open..].find('>') {
+            Some(close) => rest = &rest[open + close + 1..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Remove a trailing ` - Publisher`. `<source>` is the ground truth, so try it first with the
@@ -122,5 +159,79 @@ mod tests {
         let out = parse(xml.as_bytes()).expect("parses");
         assert_eq!(out.items[0].title, "Sadə başlıq");
         assert_eq!(out.items[0].publisher, None);
+    }
+
+    /// Attribution is keyed on the item's own link, so one item missing a `<source>` cannot
+    /// shift its neighbours onto each other's outlet.
+    #[test]
+    fn an_item_without_a_source_does_not_shift_its_neighbours() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item><title>Birinci - Day.Az</title><link>https://news.google.com/rss/articles/1</link>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az">Day.Az</source></item>
+        <item><title>İkinci</title><link>https://news.google.com/rss/articles/2</link>
+        <pubDate>Mon, 14 Sep 2026 10:00:00 GMT</pubDate></item>
+        <item><title>Üçüncü - APA</title><link>https://news.google.com/rss/articles/3</link>
+        <pubDate>Mon, 14 Sep 2026 09:00:00 GMT</pubDate>
+        <source url="https://apa.az">APA</source></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items.len(), 3);
+        assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
+        assert_eq!(out.items[1].publisher, None);
+        assert_eq!(out.items[2].publisher.as_deref(), Some("APA"));
+    }
+
+    /// An item with no link is skipped and counted, and its `<source>` must not leak onto the
+    /// next item, whose publisher comes from its own link.
+    #[test]
+    fn a_linkless_item_is_skipped_and_leaves_the_next_publisher_intact() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item><title>Linksiz - Day.Az</title>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az">Day.Az</source></item>
+        <item><title>İkinci xəbər - APA</title><link>https://news.google.com/rss/articles/2</link>
+        <pubDate>Mon, 14 Sep 2026 10:00:00 GMT</pubDate>
+        <source url="https://apa.az">APA</source></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.skipped, 1);
+        assert_eq!(out.items[0].publisher.as_deref(), Some("APA"));
+        assert_eq!(out.items[0].title, "İkinci xəbər");
+    }
+
+    #[test]
+    fn items_carrying_attributes_still_parse() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item foo="1" bar="2"><title>Bakıda yollar bağlıdır - Day.Az</title>
+        <link>https://news.google.com/rss/articles/abc</link>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az">Day.Az</source></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].title, "Bakıda yollar bağlıdır");
+        assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
+    }
+
+    #[test]
+    fn a_cdata_wrapped_publisher_is_plain_text() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item><title>Bakıda yollar bağlıdır - Day.Az</title>
+        <link>https://news.google.com/rss/articles/abc</link>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az"><![CDATA[Day.Az]]></source></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
+    }
+
+    #[test]
+    fn entities_in_a_publisher_are_decoded() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item><title>Bakıda yollar bağlıdır - Day &amp; Az</title>
+        <link>https://news.google.com/rss/articles/abc</link>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az">Day &amp; Az</source></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items[0].publisher.as_deref(), Some("Day & Az"));
+        assert_eq!(out.items[0].title, "Bakıda yollar bağlıdır");
     }
 }

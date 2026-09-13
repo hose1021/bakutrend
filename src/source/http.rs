@@ -75,16 +75,21 @@ impl Fetcher for HttpFetcher {
             }
             SourceKind::Telegram => {
                 let html = String::from_utf8_lossy(&body);
-                let outcome = source::telegram::parse(&html);
-                // HTTP 200 with no posts means the channel disabled previews. Reporting that
-                // as "0 new items" would hide a dead source.
-                if outcome.items.is_empty() {
-                    return Err(FetchError::EmptyPreview { handle: source.locator.clone() });
-                }
-                Ok(outcome)
+                telegram_outcome(source::telegram::parse(&html), &source.locator)
             }
         }
     }
+}
+
+/// Telegram answers HTTP 200 even for a channel that disabled previews, with a page that has no
+/// post containers at all. Reporting that as "0 new items" would make a dead source look like a
+/// quiet channel, so it is `EmptyPreview`. Containers that all failed to parse are a different
+/// thing — a malformed or unsupported channel — and the skips are worth recording.
+fn telegram_outcome(outcome: ParseOutcome, handle: &str) -> Result<ParseOutcome, FetchError> {
+    if outcome.items.is_empty() && outcome.skipped == 0 {
+        return Err(FetchError::EmptyPreview { handle: handle.to_string() });
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -102,5 +107,23 @@ mod tests {
         let url = google_url("azerbaycan baki", "7d");
         assert!(url.contains("q=azerbaycan+baki+when:7d"), "{url}");
         assert!(url.contains("hl=az"), "{url}");
+    }
+
+    /// The Task 3 parser reports zero items AND zero skips for a page with no post containers;
+    /// that is the previews-disabled shape and the only one that may look like a dead source.
+    #[test]
+    fn a_page_with_no_containers_is_an_empty_preview() {
+        let err = telegram_outcome(ParseOutcome::default(), "@apatv").unwrap_err();
+        assert!(
+            matches!(err, FetchError::EmptyPreview { ref handle } if handle == "@apatv"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn containers_that_all_failed_to_parse_are_skips_not_a_dead_source() {
+        let outcome = ParseOutcome { items: Vec::new(), skipped: 2 };
+        let kept = telegram_outcome(outcome, "@apatv").expect("a source that needs no backoff");
+        assert_eq!(kept.skipped, 2);
     }
 }
