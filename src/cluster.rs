@@ -16,12 +16,18 @@ pub fn similarity(a: &[String], b: &[String]) -> f64 {
     shared as f64 / union as f64
 }
 
-/// Stable identifier for a story: its first few tokens.
+/// Stable identifier for a story: its whole sorted, deduplicated token set.
+///
+/// Truncating would collide — two groups below the threshold can share a prefix and differ
+/// later — and Task 12 keys rank deltas on this string, where a collision means both stories
+/// report the wrong movement. Distinct groups necessarily have distinct token sets (identical
+/// sets score 1.0 and would have merged), so the full set is collision-free by construction
+/// while staying stable across polls.
 pub fn signature(tokens: &[String]) -> String {
     if tokens.is_empty() {
         return "empty".to_string();
     }
-    tokens.iter().take(6).cloned().collect::<Vec<_>>().join("-")
+    tokens.join("-")
 }
 
 #[derive(Debug, Clone)]
@@ -100,14 +106,23 @@ impl Clusterer {
 
         for item in ordered {
             let item_tokens = tokens(&item.title);
-            let mut candidates: Vec<usize> = Vec::new();
-            for token in &item_tokens {
-                if let Some(owners) = index.get(token) {
-                    candidates.extend_from_slice(owners);
+            // The index only covers token-sharing groups, which is a complete candidate set
+            // only while a match requires a shared token. At a non-positive threshold a group
+            // with nothing in common can still match, so fall back to every group and keep the
+            // two entry points in agreement.
+            let candidates: Vec<usize> = if self.threshold <= 0.0 {
+                (0..groups.len()).collect()
+            } else {
+                let mut indexed: Vec<usize> = Vec::new();
+                for token in &item_tokens {
+                    if let Some(owners) = index.get(token) {
+                        indexed.extend_from_slice(owners);
+                    }
                 }
-            }
-            candidates.sort_unstable();
-            candidates.dedup();
+                indexed.sort_unstable();
+                indexed.dedup();
+                indexed
+            };
 
             let mut best: Option<(usize, f64)> = None;
             for group_index in candidates {
@@ -215,9 +230,36 @@ mod tests {
     }
 
     #[test]
-    fn signature_is_stable_and_short() {
+    fn zero_threshold_groups_the_same_through_both_entry_points() {
+        let clusterer = Clusterer::new(0.0);
+        let items = vec![
+            item(1, 1, "Bakıda bu yollar bağlıdır", 100),
+            item(2, 2, "Gəncədə toy karvanı qəza etdi", 200),
+        ];
+
+        let mut assigned = Vec::new();
+        for row in &items {
+            clusterer.assign(&mut assigned, row);
+        }
+        let grouped = clusterer.group_items(&items);
+
+        assert_eq!(assigned.len(), 1, "at threshold 0 even a disjoint headline matches");
+        assert_eq!(grouped.len(), 1, "group_items must agree with assign at threshold 0");
+    }
+
+    #[test]
+    fn signature_is_stable_and_collision_free() {
         let tokens = vec!["a".to_string(), "b".to_string()];
         assert_eq!(signature(&tokens), "a-b");
         assert_eq!(signature(&[]), "empty");
+
+        let long = |last: &str| -> Vec<String> {
+            ["a", "b", "c", "d", "e", "f", last].iter().map(|s| s.to_string()).collect()
+        };
+        assert_ne!(
+            signature(&long("g")),
+            signature(&long("h")),
+            "keys that differ only after the sixth token must not collide"
+        );
     }
 }
