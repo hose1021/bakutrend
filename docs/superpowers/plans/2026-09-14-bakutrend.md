@@ -1118,14 +1118,15 @@ use crate::error::StoreError;
 use crate::source::{ParsedItem, SourceKind, SourceSpec};
 use crate::text::fold;
 
-/// Identity of an outlet, ignoring case, punctuation and site suffixes.
+/// Identity of an outlet: the brand part of the name, folded. `Report.az`, `www.report.az`
+/// and `report` are one outlet. Only the segment before the first dot is kept, so a site
+/// suffix cannot split one outlet into two rows.
 pub fn outlet_key(name: &str) -> String {
-    fold(name)
+    let brand = name.strip_prefix("www.").unwrap_or(name);
+    fold(brand.split('.').next().unwrap_or(brand))
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect::<String>()
-        .trim_start_matches("www")
-        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1272,29 +1273,11 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Resolve an outlet by name, creating it when absent. Reuses an existing outlet
-    /// whose key is a prefix, so Google's `Report.az` lands on the configured `Report`.
+    /// Resolve an outlet by name, creating it when absent. Matching is EXACT on the folded
+    /// brand key: a prefix fallback would merge distinct outlets (`Baku Post` into `Baku.ws`)
+    /// and would make the outcome depend on registration order.
     pub fn resolve_outlet(&self, name: &str) -> Result<i64, StoreError> {
-        let key = outlet_key(name);
-        let existing: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM outlets WHERE key = ?1
-                 UNION ALL
-                 SELECT id FROM outlets WHERE length(key) >= 4 AND (?1 LIKE key || '%' OR key LIKE ?1 || '%')
-                 LIMIT 1",
-                [&key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            return Ok(id);
-        }
-        self.conn.execute(
-            "INSERT INTO outlets (name, key) VALUES (?1, ?2)",
-            rusqlite::params![name, key],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        resolve_outlet_in(&self.conn, name)
     }
 
     pub fn ensure_source(&mut self, spec: &SourceSpec, enabled: bool) -> Result<i64, StoreError> {
@@ -1373,11 +1356,17 @@ impl Store {
                                     section, published_at, first_seen, last_seen, views, cited, is_backfill)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)
                  ON CONFLICT(source_id, external_id) DO UPDATE SET
+                   outlet_id = excluded.outlet_id,
                    last_seen = excluded.last_seen,
                    title = excluded.title,
                    description = excluded.description,
                    section = excluded.section,
-                   views = COALESCE(excluded.views, items.views),
+                   views = CASE
+                     WHEN excluded.views IS NULL THEN items.views
+                     WHEN items.views IS NULL THEN excluded.views
+                     WHEN excluded.views > items.views THEN excluded.views
+                     ELSE items.views
+                   END,
                    cited = excluded.cited,
                    is_backfill = excluded.is_backfill",
                 rusqlite::params![
@@ -1412,23 +1401,18 @@ impl Store {
     }
 }
 
-fn resolve_outlet_in(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<i64, StoreError> {
+/// Single outlet lookup, shared by `resolve_outlet` and the upsert transaction
+/// (`Transaction` derefs to `Connection`, so both callers use this one query).
+fn resolve_outlet_in(conn: &Connection, name: &str) -> Result<i64, StoreError> {
     let key = outlet_key(name);
-    let existing: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM outlets WHERE key = ?1
-             UNION ALL
-             SELECT id FROM outlets WHERE length(key) >= 4 AND (?1 LIKE key || '%' OR key LIKE ?1 || '%')
-             LIMIT 1",
-            [&key],
-            |r| r.get(0),
-        )
+    let existing: Option<i64> = conn
+        .query_row("SELECT id FROM outlets WHERE key = ?1", [&key], |r| r.get(0))
         .optional()?;
     if let Some(id) = existing {
         return Ok(id);
     }
-    tx.execute("INSERT INTO outlets (name, key) VALUES (?1, ?2)", rusqlite::params![name, key])?;
-    Ok(tx.last_insert_rowid())
+    conn.execute("INSERT INTO outlets (name, key) VALUES (?1, ?2)", rusqlite::params![name, key])?;
+    Ok(conn.last_insert_rowid())
 }
 ```
 
