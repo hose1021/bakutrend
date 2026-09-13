@@ -1,6 +1,7 @@
 //! Source types, item shape, and the text rules that apply to every ingested item.
 
 pub mod rss;
+pub mod telegram;
 
 use crate::text;
 
