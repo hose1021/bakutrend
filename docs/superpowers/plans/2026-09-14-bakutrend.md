@@ -857,9 +857,12 @@ use scraper::{Html, Selector};
 use crate::source::{section_from_url, ParseOutcome, ParsedItem};
 use crate::text::{collapse_ws, decode_entities};
 
-/// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number.
+/// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number, and groups
+/// thousands with a no-break space (`12 345`). A value that fails to parse would silently drop
+/// the post's engagement signal, so every kind of whitespace is stripped, not just the ends.
 pub fn parse_views(raw: &str) -> Option<i64> {
-    let cleaned = raw.trim().replace('\u{a0}', " ").replace(',', ".");
+    let cleaned = raw.replace(',', ".");
+    let cleaned = cleaned.split_whitespace().collect::<String>();
     if cleaned.is_empty() {
         return None;
     }
@@ -878,7 +881,11 @@ pub fn parse_views(raw: &str) -> Option<i64> {
 pub fn parse(html: &str) -> ParseOutcome {
     // Static selectors: a failure here is a programming error, not a runtime condition.
     let post_selector = Selector::parse("div.tgme_widget_message").expect("static selector");
-    let time_selector = Selector::parse("time").expect("static selector");
+    // The post timestamp is the footer anchor's `<time>`. A bare `time` selector is wrong here:
+    // bakupost video posts carry `<time class="message_video_duration">` first, and an earlier
+    // `<time datetime>` elsewhere in the post is likewise not the post time.
+    let time_selector =
+        Selector::parse("a.tgme_widget_message_date time[datetime]").expect("static selector");
     let views_selector = Selector::parse(".tgme_widget_message_views").expect("static selector");
     let text_selector = Selector::parse(".tgme_widget_message_text").expect("static selector");
     let link_selector = Selector::parse("a.tgme_widget_message_date").expect("static selector");
