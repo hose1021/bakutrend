@@ -163,29 +163,11 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Resolve an outlet by name, creating it when absent. Reuses an existing outlet
-    /// whose key is a prefix, so Google's `Report.az` lands on the configured `Report`.
+    /// Resolve an outlet by exact folded key, creating it when absent. `outlet_key`
+    /// already reduces `Report.az` to `report`, so an exact match is enough; a prefix
+    /// fallback would merge distinct outlets (`Baku Post` into `Baku.ws`).
     pub fn resolve_outlet(&self, name: &str) -> Result<i64, StoreError> {
-        let key = outlet_key(name);
-        let existing: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM outlets WHERE key = ?1
-                 UNION ALL
-                 SELECT id FROM outlets WHERE length(key) >= 4 AND (?1 LIKE key || '%' OR key LIKE ?1 || '%')
-                 LIMIT 1",
-                [&key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            return Ok(id);
-        }
-        self.conn.execute(
-            "INSERT INTO outlets (name, key) VALUES (?1, ?2)",
-            rusqlite::params![name, key],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        resolve_outlet_in(&self.conn, name)
     }
 
     pub fn ensure_source(&mut self, spec: &SourceSpec, enabled: bool) -> Result<i64, StoreError> {
@@ -264,11 +246,17 @@ impl Store {
                                     section, published_at, first_seen, last_seen, views, cited, is_backfill)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)
                  ON CONFLICT(source_id, external_id) DO UPDATE SET
+                   outlet_id = excluded.outlet_id,
                    last_seen = excluded.last_seen,
                    title = excluded.title,
                    description = excluded.description,
                    section = excluded.section,
-                   views = COALESCE(excluded.views, items.views),
+                   views = CASE
+                     WHEN excluded.views IS NULL THEN items.views
+                     WHEN items.views IS NULL THEN excluded.views
+                     WHEN excluded.views > items.views THEN excluded.views
+                     ELSE items.views
+                   END,
                    cited = excluded.cited,
                    is_backfill = excluded.is_backfill",
                 rusqlite::params![
@@ -303,23 +291,18 @@ impl Store {
     }
 }
 
-fn resolve_outlet_in(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<i64, StoreError> {
+/// Single outlet lookup, shared by `resolve_outlet` and the upsert transaction
+/// (`Transaction` derefs to `Connection`, so both callers use this one query).
+fn resolve_outlet_in(conn: &Connection, name: &str) -> Result<i64, StoreError> {
     let key = outlet_key(name);
-    let existing: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM outlets WHERE key = ?1
-             UNION ALL
-             SELECT id FROM outlets WHERE length(key) >= 4 AND (?1 LIKE key || '%' OR key LIKE ?1 || '%')
-             LIMIT 1",
-            [&key],
-            |r| r.get(0),
-        )
+    let existing: Option<i64> = conn
+        .query_row("SELECT id FROM outlets WHERE key = ?1", [&key], |r| r.get(0))
         .optional()?;
     if let Some(id) = existing {
         return Ok(id);
     }
-    tx.execute("INSERT INTO outlets (name, key) VALUES (?1, ?2)", rusqlite::params![name, key])?;
-    Ok(tx.last_insert_rowid())
+    conn.execute("INSERT INTO outlets (name, key) VALUES (?1, ?2)", rusqlite::params![name, key])?;
+    Ok(conn.last_insert_rowid())
 }
 
 #[cfg(test)]
@@ -424,6 +407,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(credited, "Report", "Report.az must resolve to the existing Report outlet");
+    }
+
+    #[test]
+    fn distinct_outlets_whose_keys_are_prefix_related_never_merge() {
+        fn outlet_count(order: [&str; 2]) -> i64 {
+            let mut store = Store::open_in_memory().unwrap();
+            for (i, outlet) in order.iter().enumerate() {
+                let locator = format!("https://example.az/{i}/rss");
+                store.ensure_source(&spec(outlet, outlet, &locator), true).unwrap();
+            }
+            store.conn.query_row("SELECT COUNT(*) FROM outlets", [], |r| r.get(0)).unwrap()
+        }
+
+        assert_eq!(outlet_count(["Baku.ws", "Baku Post"]), 2);
+        assert_eq!(outlet_count(["Baku Post", "Baku.ws"]), 2);
+        assert_eq!(outlet_count(["APA", "Apa TV"]), 2);
+        assert_eq!(outlet_count(["Apa TV", "APA"]), 2);
+    }
+
+    #[test]
+    fn a_later_publisher_moves_the_item_to_the_resolved_outlet() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.ensure_source(&spec("Report", "Report RSS", "https://report.az/rss/"), true).unwrap();
+        let seed = store
+            .ensure_source(
+                &SourceSpec {
+                    kind: SourceKind::Google,
+                    outlet: "Google News".to_string(),
+                    name: "Google News 7d".to_string(),
+                    locator: "google:7d".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+
+        store.upsert_items(seed, &[item("g1", "Bakıda yol qəzası", 1_700_000_000)], 1_700_000_000).unwrap();
+        let mut attributed = item("g1", "Bakıda yol qəzası", 1_700_000_000);
+        attributed.publisher = Some("Report.az".to_string());
+        store.upsert_items(seed, &[attributed], 1_700_000_600).unwrap();
+
+        let credited: String = store
+            .conn
+            .query_row(
+                "SELECT o.name FROM items i JOIN outlets o ON o.id = i.outlet_id WHERE i.external_id = 'g1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(credited, "Report", "a publisher that arrives late must reattribute the item");
+    }
+
+    #[test]
+    fn stored_views_never_go_backwards() {
+        fn stored(store: &Store) -> Option<i64> {
+            store
+                .conn
+                .query_row("SELECT views FROM items WHERE external_id = 'a'", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        let (mut store, source_id) = fixture();
+        let mut payload = item("a", "Başlıq", 1_700_000_000);
+
+        payload.views = Some(100);
+        store.upsert_items(source_id, &[payload.clone()], 1_700_000_000).unwrap();
+        assert_eq!(stored(&store), Some(100));
+
+        payload.views = Some(90);
+        store.upsert_items(source_id, &[payload.clone()], 1_700_000_060).unwrap();
+        assert_eq!(stored(&store), Some(100), "a stale lower count must not overwrite a higher one");
+
+        payload.views = Some(150);
+        store.upsert_items(source_id, &[payload.clone()], 1_700_000_120).unwrap();
+        assert_eq!(stored(&store), Some(150));
+
+        payload.views = None;
+        store.upsert_items(source_id, &[payload.clone()], 1_700_000_180).unwrap();
+        assert_eq!(stored(&store), Some(150), "a parse without views must not erase them");
+
+        payload.views = None;
+        store.upsert_items(source_id, &[item("b", "Views yoxdur", 1_700_000_000)], 1_700_000_240).unwrap();
+        let no_views: Option<i64> = store
+            .conn
+            .query_row("SELECT views FROM items WHERE external_id = 'b'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(no_views, None, "items that never carried views stay NULL");
     }
 
     #[test]
