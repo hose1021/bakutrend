@@ -386,6 +386,8 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("source `{name}` has unknown kind `{kind}`")]
+    UnknownSourceKind { name: String, kind: String },
 }
 ```
 
@@ -2198,6 +2200,7 @@ use crate::source::SourceKind;
 use crate::store::{ItemRow, Sample, Window};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
 pub struct Weights {
     pub coverage: f64,
     pub engagement: f64,
@@ -2652,7 +2655,7 @@ fn default_sources() -> Vec<SourceConfig> {
         ("Axar.az Telegram", "@axaraz", "Axar.az", true),
         ("Minval Telegram", "@minval_az", "Minval", true),
         ("Report Telegram", "@reportnewsaz", "Report", true),
-        ("Apa TV Telegram", "@apatv", "Apa TV", false),
+        ("APATV Telegram", "@apatv", "Apa TV", false),
         ("Baku Post Telegram", "@bakupost", "Baku Post", true),
         ("Qaynarinfo Telegram", "@qaynarinfo", "Qaynarinfo", true),
         ("Meydan TV Telegram", "@meydantv", "Meydan TV", true),
@@ -2697,13 +2700,26 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&raw).map_err(|source| ConfigError::Toml {
+        let config: Self = toml::from_str(&raw).map_err(|source| ConfigError::Toml {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        // Validate at LOAD time. A `filter_map` in `source_specs` would silently drop a source
+        // whose `kind` is a typo, and the user would see fewer sources with nothing explaining why.
+        for source in &config.sources {
+            if SourceKind::parse(&source.kind).is_none() {
+                return Err(ConfigError::UnknownSourceKind {
+                    name: source.name.clone(),
+                    kind: source.kind.clone(),
+                });
+            }
+        }
+        Ok(config)
     }
 
-    /// Config entries become source specs; unknown `kind` values are skipped.
+    /// Config entries become source specs. Every `kind` is already validated by `load`, so the
+    /// `filter_map` here can only ever see valid values; it stays infallible on purpose so
+    /// callers need no error handling for a state the loader has excluded.
     pub fn source_specs(&self) -> Vec<(SourceSpec, bool)> {
         self.sources
             .iter()
@@ -2733,7 +2749,7 @@ pub mod dirs;
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test --lib config:: dirs:: 2>&1 | tail -30`
+Run: `cargo test --lib -- config:: dirs:: 2>&1 | tail -30`
 Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
