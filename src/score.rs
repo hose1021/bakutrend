@@ -56,14 +56,11 @@ pub struct ItemRate {
     pub views: i64,
 }
 
-/// Views gained per hour. With two samples at least ten minutes apart this is the observed
-/// slope; otherwise it spreads the total over the item's age, floored at a quarter hour.
-pub fn views_per_hour(samples: &[Sample], item_id: i64, published_at: i64, now: i64) -> Option<f64> {
-    let mut owned: Vec<&Sample> = samples.iter().filter(|s| s.item_id == item_id).collect();
-    if owned.is_empty() {
-        return None;
-    }
-    owned.sort_by_key(|s| s.ts);
+/// Views gained per hour for one item's samples, which must already be sorted by `ts`. With two
+/// samples at least ten minutes apart this is the observed slope; otherwise it spreads the total
+/// over the item's age, floored at a quarter hour. Both paths return views per hour, so callers
+/// can add rates from different items together.
+fn rate_of(owned: &[&Sample], published_at: i64, now: i64) -> Option<f64> {
     let first = owned.first()?;
     let last = owned.last()?;
     if owned.len() >= 2 && last.ts - first.ts >= 600 {
@@ -72,6 +69,30 @@ pub fn views_per_hour(samples: &[Sample], item_id: i64, published_at: i64, now: 
     }
     let age_hours = ((now - published_at).max(0) as f64 / 3600.0).max(0.25);
     Some(last.views as f64 / age_hours)
+}
+
+/// Views gained per hour for one item, scanned out of a raw sample slice. `rank` goes through
+/// [`sample_index`] instead, which sorts each item's samples once rather than once per call;
+/// both routes end in [`rate_of`], so they cannot disagree.
+pub fn views_per_hour(samples: &[Sample], item_id: i64, published_at: i64, now: i64) -> Option<f64> {
+    let mut owned: Vec<&Sample> = samples.iter().filter(|s| s.item_id == item_id).collect();
+    owned.sort_by_key(|s| s.ts);
+    rate_of(&owned, published_at, now)
+}
+
+/// Every item's samples, grouped by item and sorted by `ts`, built once per `rank` call. A
+/// per-item filter over the whole slice would cost items x samples and re-sort the same rows
+/// again and again; on a week of Telegram posts that is the difference between milliseconds and
+/// seconds.
+fn sample_index(samples: &[Sample]) -> HashMap<i64, Vec<&Sample>> {
+    let mut index: HashMap<i64, Vec<&Sample>> = HashMap::new();
+    for sample in samples {
+        index.entry(sample.item_id).or_default().push(sample);
+    }
+    for owned in index.values_mut() {
+        owned.sort_by_key(|s| s.ts);
+    }
+    index
 }
 
 fn median(values: &mut Vec<f64>) -> f64 {
@@ -101,17 +122,24 @@ pub fn rank(
         }
     }
 
+    // Each Telegram item's rate is computed exactly once here and reused by its outlet's
+    // contribution and by its story's engagement total.
+    let by_item = sample_index(samples);
     let mut rates: Vec<ItemRate> = Vec::new();
+    let mut rate_of_item: HashMap<i64, f64> = HashMap::new();
     for group in groups {
         for item in &group.items {
             if item.kind != SourceKind::Telegram {
                 continue;
             }
             let Some(views) = item.views else { continue };
-            let Some(rate) = views_per_hour(samples, item.item_id, item.published_at, now) else {
+            let Some(rate) =
+                by_item.get(&item.item_id).and_then(|owned| rate_of(owned, item.published_at, now))
+            else {
                 continue;
             };
             rates.push(ItemRate { item_id: item.item_id, source_id: item.source_id, rate, views });
+            rate_of_item.insert(item.item_id, rate);
         }
     }
 
@@ -149,8 +177,7 @@ pub fn rank(
             if item.kind == SourceKind::Telegram {
                 if let Some(views) = item.views {
                     entry.views = Some(entry.views.unwrap_or(0).max(views));
-                    entry.views_per_hour =
-                        views_per_hour(samples, item.item_id, item.published_at, now);
+                    entry.views_per_hour = rate_of_item.get(&item.item_id).copied();
                 }
             }
             let flag = any_uncited.entry(item.outlet_id).or_insert(false);
@@ -292,22 +319,48 @@ mod tests {
 
     #[test]
     fn engagement_is_normalized_per_channel() {
-        // Channel 10 habitually gets 1000 views/hour; channel 20 gets 50.
+        // Channel 10 carries a breakout post (1000 views/hour) and a routine one (100); channel
+        // 20 carries one post at 50. A per-story median would score all three at exactly 1.0, so
+        // the numbers below only hold when the baseline is the channel's whole window.
         let mut samples = Vec::new();
         let big = story(&[(1, 10, "Böyük kanal xəbəri budur", 1, Some(1000), false)]);
+        let routine = story(&[(1, 10, "Adi gün xəbəri budur", 1, Some(100), false)]);
         let small = story(&[(2, 20, "Kiçik kanal xəbəri budur", 1, Some(50), false)]);
         views_for(&big, 1000, &mut samples);
+        views_for(&routine, 100, &mut samples);
         views_for(&small, 50, &mut samples);
 
-        let ranked = rank(&[big, small], &samples, Window::Hour, &Weights::default(), NOW);
-        let big_score = ranked.iter().find(|s| s.title.contains("Böyük")).unwrap();
-        let small_score = ranked.iter().find(|s| s.title.contains("Kiçik")).unwrap();
+        let ranked =
+            rank(&[big, routine, small], &samples, Window::Hour, &Weights::default(), NOW);
+        let score = |title: &str| ranked.iter().find(|s| s.title.contains(title)).unwrap();
+        let big_score = score("Böyük");
+        let routine_score = score("Adi");
+        let small_score = score("Kiçik");
+
+        // Channel 10's window median is (100 + 1000) / 2 = 550, not each story's own rate.
         assert!(
-            (big_score.engagement_norm - small_score.engagement_norm).abs() < 0.05,
-            "each channel's median makes its own story the baseline: {} vs {}",
-            big_score.engagement_norm,
-            small_score.engagement_norm
+            (big_score.engagement - 1000.0 / 550.0).abs() < 1e-9,
+            "breakout post against the channel median: {}",
+            big_score.engagement
         );
+        assert!(
+            (routine_score.engagement - 100.0 / 550.0).abs() < 1e-9,
+            "routine post against the same channel median: {}",
+            routine_score.engagement
+        );
+        assert!(
+            (small_score.engagement - 1.0).abs() < 1e-9,
+            "the small channel's only post is its own median: {}",
+            small_score.engagement
+        );
+
+        // The 50-view channel is not dwarfed by the 1000-view one: normalised against the
+        // window's best, it keeps 550/1000 of the score a raw view count would have cut to 1/20.
+        assert!((big_score.engagement_norm - 1.0).abs() < 1e-9);
+        assert!((small_score.engagement_norm - 550.0 / 1000.0).abs() < 1e-9);
+        assert!((routine_score.engagement_norm - 0.1).abs() < 1e-9);
+        assert!(big_score.engagement_norm > small_score.engagement_norm);
+        assert!(small_score.engagement_norm > routine_score.engagement_norm);
     }
 
     #[test]
@@ -363,5 +416,44 @@ mod tests {
         let narrow = story(&[(4, 40, "Yalnız bir yerdə olan xəbər", 1, None, false)]);
         let ranked = rank(&[narrow, broad], &[], Window::Hour, &Weights::default(), NOW);
         assert_eq!(ranked[0].coverage, 2.0);
+    }
+
+    #[test]
+    fn a_story_scores_only_from_its_own_items_samples() {
+        // One slice holds every story's samples, interleaved and with each item's own rows out
+        // of order, so an index keyed on anything but the item id would attribute one story's
+        // views to another. Each channel has one item, so a correctly attributed rate is its
+        // own channel's median and every story's engagement is exactly 1.0.
+        let slipped = story(&[(1, 10, "Böyük yol qəzası budur", 2, Some(600), false)]);
+        let single = story(&[(2, 20, "Kiçik kanal xəbəri budur", 2, Some(120), false)]);
+        let risen = story(&[(3, 30, "Orta xəbər belə gəldi", 1, Some(250), false)]);
+        let (slipped_id, single_id, risen_id) =
+            (slipped.items[0].item_id, single.items[0].item_id, risen.items[0].item_id);
+
+        let samples = vec![
+            Sample { item_id: slipped_id, ts: NOW - 3600, views: 600 },
+            Sample { item_id: single_id, ts: NOW, views: 120 },
+            Sample { item_id: risen_id, ts: NOW, views: 250 },
+            Sample { item_id: slipped_id, ts: NOW - 7200, views: 0 },
+            Sample { item_id: risen_id, ts: NOW - 3600, views: 100 },
+        ];
+
+        let ranked = rank(&[slipped, single, risen], &samples, Window::Hour, &Weights::default(), NOW);
+        let story = |title: &str| ranked.iter().find(|s| s.title == title).unwrap();
+
+        let slipped = story("Böyük yol qəzası budur");
+        assert_eq!(slipped.outlets[0].views_per_hour, Some(600.0), "slope branch, own samples only");
+        assert_eq!(slipped.view_count, 600);
+        assert_eq!(slipped.engagement, 1.0);
+
+        let single = story("Kiçik kanal xəbəri budur");
+        assert_eq!(single.outlets[0].views_per_hour, Some(60.0), "age fallback, own sample only");
+        assert_eq!(single.view_count, 120);
+        assert_eq!(single.engagement, 1.0);
+
+        let risen = story("Orta xəbər belə gəldi");
+        assert_eq!(risen.outlets[0].views_per_hour, Some(150.0), "slope branch, own samples only");
+        assert_eq!(risen.view_count, 250);
+        assert_eq!(risen.engagement, 1.0);
     }
 }
