@@ -54,4 +54,6 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("source `{name}` has unknown kind `{kind}`")]
+    UnknownSourceKind { name: String, kind: String },
 }

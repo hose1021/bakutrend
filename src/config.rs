@@ -121,13 +121,25 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&raw).map_err(|source| ConfigError::Toml {
+        let config: Self = toml::from_str(&raw).map_err(|source| ConfigError::Toml {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        // Reject unknown kinds here rather than dropping the source later: a typo would
+        // otherwise delete a configured source with nothing to explain it.
+        for source in &config.sources {
+            if SourceKind::parse(&source.kind).is_none() {
+                return Err(ConfigError::UnknownSourceKind {
+                    name: source.name.clone(),
+                    kind: source.kind.clone(),
+                });
+            }
+        }
+        Ok(config)
     }
 
-    /// Config entries become source specs; unknown `kind` values are skipped.
+    /// Config entries become source specs. Every kind is already valid: [`Config::load`]
+    /// rejects unknown ones, and [`Config::default`] only ships known kinds.
     pub fn source_specs(&self) -> Vec<(SourceSpec, bool)> {
         self.sources
             .iter()
@@ -197,5 +209,50 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.poll_interval_secs, 900);
         assert_eq!(config.sources.len(), 20, "unset keys keep their defaults");
+    }
+
+    #[test]
+    fn a_partial_weights_table_keeps_the_keys_it_omits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[weights]\ncoverage = 0.5\n").unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert!((config.weights.coverage - 0.5).abs() < 1e-9);
+        assert!((config.weights.engagement - 0.40).abs() < 1e-9, "an omitted key keeps its default");
+        assert!((config.weights.freshness - 0.20).abs() < 1e-9, "an omitted key keeps its default");
+    }
+
+    #[test]
+    fn a_present_but_empty_retention_table_keeps_its_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[retention]\n").unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.retention.view_sample_days, 30, "an omitted key keeps its default");
+    }
+
+    #[test]
+    fn an_unknown_source_kind_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = |kind: &str| {
+            format!(
+                "[[sources]]\nname = \"Broken Feed\"\nkind = \"{kind}\"\n\
+                 locator = \"https://example.test/rss\"\noutlet = \"Example\"\n"
+            )
+        };
+
+        std::fs::write(&path, source("rsss")).unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("Broken Feed"), "error names the source: {err}");
+        assert!(err.contains("rsss"), "error names the bad kind: {err}");
+
+        std::fs::write(&path, source("rss")).unwrap();
+        assert!(Config::load(&path).is_ok(), "a valid kind still loads");
+
+        std::fs::write(&path, source("telegram")).unwrap();
+        assert!(Config::load(&path).is_ok(), "a valid kind still loads");
     }
 }

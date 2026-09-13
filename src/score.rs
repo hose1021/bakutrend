@@ -10,6 +10,7 @@ use crate::source::SourceKind;
 use crate::store::{Sample, Window};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
 pub struct Weights {
     pub coverage: f64,
     pub engagement: f64,
