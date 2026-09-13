@@ -85,16 +85,22 @@ pub fn poll_once(
         }
     }
 
-    // One-shot week seed: only when no locally observed week data exists yet.
+    // One-shot week seed: only when no locally observed week data exists yet, and on the same
+    // backoff as every other source. A failed seed leaves the week empty, so without the guard
+    // an unreachable Google would be retried every cycle forever.
     if !has_week_data {
         if let Some(seed) = sources.iter().find(|s| s.kind == SourceKind::Google) {
-            match fetcher.fetch(seed) {
-                Ok(outcome) => {
-                    store.upsert_items(seed.id, &outcome.items, now)?;
-                }
-                Err(error) => {
-                    log::warn!("google backfill failed: {error}");
-                    report.failed.push((seed.name.clone(), error.to_string()));
+            if backoff.is_due(seed.id, now) {
+                match fetcher.fetch(seed) {
+                    Ok(outcome) => {
+                        backoff.record_ok(seed.id);
+                        store.upsert_items(seed.id, &outcome.items, now)?;
+                    }
+                    Err(error) => {
+                        backoff.record_failure(seed.id, now);
+                        log::warn!("google backfill failed: {error}");
+                        report.failed.push((seed.name.clone(), error.to_string()));
+                    }
                 }
             }
         }
@@ -203,6 +209,58 @@ mod tests {
         assert_eq!(store.item_count().unwrap(), 0);
     }
 
+    fn google_source(store: &mut Store) -> i64 {
+        store
+            .ensure_source(
+                &SourceSpec {
+                    kind: SourceKind::Google,
+                    outlet: "Google News".into(),
+                    name: "Google News AZ".into(),
+                    locator: "https://news.google.com/rss/search?q=az".into(),
+                },
+                true,
+            )
+            .unwrap()
+    }
+
+    /// Records every attempt and always fails, so a cycle's retries are observable.
+    struct AlwaysFailingFetcher {
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Fetcher for AlwaysFailingFetcher {
+        fn fetch(&self, source: &crate::store::SourceRow) -> Result<ParseOutcome, FetchError> {
+            self.calls.borrow_mut().push(source.locator.clone());
+            Err(FetchError::Http { status: 500, url: source.locator.clone() })
+        }
+    }
+
+    #[test]
+    fn a_failing_google_seed_backs_off_instead_of_retrying_every_cycle() {
+        let mut store = store_with_two_sources();
+        google_source(&mut store);
+        let fetcher = AlwaysFailingFetcher { calls: std::cell::RefCell::new(Vec::new()) };
+        let mut backoff = Backoff::new();
+        let now = 1_700_000_000;
+        let seeds = || {
+            fetcher
+                .calls
+                .borrow()
+                .iter()
+                .filter(|locator| locator.contains("news.google.com"))
+                .count()
+        };
+
+        let first = poll_once(&mut store, &fetcher, &mut backoff, now, 30).unwrap();
+        assert_eq!(seeds(), 1, "an empty week triggers the seed");
+        assert!(first.failed.iter().any(|(name, _)| name == "Google News AZ"));
+
+        let second = poll_once(&mut store, &fetcher, &mut backoff, now + 30, 30).unwrap();
+        assert_eq!(seeds(), 1, "a failed seed waits out its backoff, it does not retry every cycle");
+        assert_eq!(fetcher.calls.borrow().len(), 3, "nothing is retried while backing off");
+        assert!(second.failed.is_empty(), "a skipped source is not reported as a failure");
+    }
+
     /// Serves one fresh item for every feed source, so a cycle leaves week data behind.
     struct OneItemFetcher {
         calls: std::cell::RefCell<Vec<String>>,
@@ -234,17 +292,7 @@ mod tests {
     #[test]
     fn the_google_source_is_seeded_once_and_never_polled_again() {
         let mut store = store_with_two_sources();
-        store
-            .ensure_source(
-                &SourceSpec {
-                    kind: SourceKind::Google,
-                    outlet: "Google News".into(),
-                    name: "Google News AZ".into(),
-                    locator: "https://news.google.com/rss/search?q=az".into(),
-                },
-                true,
-            )
-            .unwrap();
+        google_source(&mut store);
         let fetcher = OneItemFetcher { calls: std::cell::RefCell::new(Vec::new()) };
         let mut backoff = Backoff::new();
         let now = 1_700_000_000;
