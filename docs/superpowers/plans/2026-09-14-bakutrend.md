@@ -1826,22 +1826,41 @@ use std::collections::HashMap;
 use crate::store::ItemRow;
 use crate::text::tokens;
 
-/// Jaccard similarity over token sets. Both inputs must be sorted and deduplicated.
+/// Jaccard similarity over token sets. Both inputs must be deduplicated; order does
+/// not matter, so a caller cannot silently mis-count by passing unsorted tokens.
 pub fn similarity(a: &[String], b: &[String]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    let shared = a.iter().filter(|token| b.binary_search(token).is_ok()).count();
+    let shared = a.iter().filter(|token| b.contains(token)).count();
     let union = a.len() + b.len() - shared;
     shared as f64 / union as f64
 }
 
-/// Stable identifier for a story: its first few tokens.
+/// Stable identifier for a story: its whole sorted, deduplicated token set, joined by `-`.
+///
+/// `tokens` only ever yields alphanumeric runs, so no token contains `-` and the join is
+/// injective: distinct token sets always produce distinct keys. Task 12 keys rank deltas on
+/// this string, where a collision means both stories report the wrong movement.
+///
+/// An empty set returns `""`. Callers that need one identity per untokenized item must not use
+/// this; `Group::new` keys those by row id instead.
 pub fn signature(tokens: &[String]) -> String {
+    tokens.join("-")
+}
+
+/// Key for a group that a new item starts: its signature, or a row-id key when the title yields
+/// no tokens. An untokenized item can never match anything at a positive threshold, so each one
+/// becomes its own group; keying them all `""` would collide and Task 12 would overwrite one
+/// story's rank delta with another's. `item_id` is the database row id, stable across polls
+/// because items are upserted rather than re-inserted. The `:` prefix is unreachable from
+/// `signature`, which only ever joins alphanumeric tokens.
+fn group_key(item: &ItemRow, tokens: &[String]) -> String {
     if tokens.is_empty() {
-        return "empty".to_string();
+        format!("untokenized:{}", item.item_id)
+    } else {
+        signature(tokens)
     }
-    tokens.iter().take(6).cloned().collect::<Vec<_>>().join("-")
 }
 
 #[derive(Debug, Clone)]
@@ -1876,12 +1895,25 @@ impl Group {
     }
 }
 
+/// Similarity threshold a caller's non-finite value falls back to.
+const DEFAULT_THRESHOLD: f64 = 0.45;
+
 pub struct Clusterer {
     threshold: f64,
 }
 
 impl Clusterer {
+    /// Clamp the threshold into its meaningful range. Above 1.0 nothing can ever match —
+    /// similarity tops out at 1.0 — so identical headlines would stay in separate groups and
+    /// hand Task 12 duplicate keys. `f64::clamp` alone does not catch NaN
+    /// (`f64::NAN.clamp(0.0, 1.0)` is NaN, and every comparison against it is false), so
+    /// non-finite values take `DEFAULT_THRESHOLD`.
     pub fn new(threshold: f64) -> Self {
+        let threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_THRESHOLD
+        };
         Self { threshold }
     }
 
@@ -1920,14 +1952,23 @@ impl Clusterer {
 
         for item in ordered {
             let item_tokens = tokens(&item.title);
-            let mut candidates: Vec<usize> = Vec::new();
-            for token in &item_tokens {
-                if let Some(owners) = index.get(token) {
-                    candidates.extend_from_slice(owners);
+            // The index only covers token-sharing groups, which is a complete candidate set
+            // only while a match requires a shared token. At a non-positive threshold a group
+            // with nothing in common can still match, so fall back to every group and keep the
+            // two entry points in agreement.
+            let candidates: Vec<usize> = if self.threshold <= 0.0 {
+                (0..groups.len()).collect()
+            } else {
+                let mut indexed: Vec<usize> = Vec::new();
+                for token in &item_tokens {
+                    if let Some(owners) = index.get(token) {
+                        indexed.extend_from_slice(owners);
+                    }
                 }
-            }
-            candidates.sort_unstable();
-            candidates.dedup();
+                indexed.sort_unstable();
+                indexed.dedup();
+                indexed
+            };
 
             let mut best: Option<(usize, f64)> = None;
             for group_index in candidates {
@@ -1983,7 +2024,7 @@ git commit -m "feat: group items into stories by token overlap"
 - Modify: `src/lib.rs`
 
 **Interfaces:**
-- Consumes: `crate::cluster::Group`, `crate::store::{Sample, SourceKind, Window}`.
+- Consumes: `crate::cluster::Group`, `crate::source::SourceKind`, `crate::store::{ItemRow, Sample, Window}`.
 - Produces: `crate::score::{Weights, ScoredStory, OutletContribution, ItemRate, rank, views_per_hour}`.
   - `views_per_hour(samples: &[Sample], item_id: i64, published_at: i64, now: i64) -> Option<f64>`
   - `rank(groups: &[Group], samples: &[Sample], window: Window, weights: &Weights, now: i64) -> Vec<ScoredStory>`
@@ -1997,7 +2038,8 @@ Create `src/score.rs` with the test module first:
 mod tests {
     use super::*;
     use crate::cluster::{Clusterer, Group};
-    use crate::store::{ItemRow, Sample, SourceKind, Window};
+    use crate::source::SourceKind;
+    use crate::store::{ItemRow, Sample, Window};
 
     const NOW: i64 = 1_700_000_000;
 
@@ -2152,7 +2194,8 @@ use std::cmp::Ordering;
 use serde::Deserialize;
 
 use crate::cluster::Group;
-use crate::store::{ItemRow, Sample, SourceKind, Window};
+use crate::source::SourceKind;
+use crate::store::{ItemRow, Sample, Window};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Weights {
@@ -2271,84 +2314,78 @@ pub fn rank(
 
     let tau_hours = (window.seconds() as f64 / 3600.0) / 3.0;
 
-    let mut stories: Vec<ScoredStory> = groups
-        .iter()
-        .map(|group| {
-            let mut per_outlet: BTreeMap<i64, OutletContribution> = BTreeMap::new();
-            let mut any_uncited: BTreeMap<i64, bool> = BTreeMap::new();
+    let mut stories: Vec<ScoredStory> = Vec::with_capacity(groups.len());
+    for (group_index, group) in groups.iter().enumerate() {
+        let mut per_outlet: BTreeMap<i64, OutletContribution> = BTreeMap::new();
+        let mut any_uncited: BTreeMap<i64, bool> = BTreeMap::new();
 
-            for item in &group.items {
-                let entry = per_outlet.entry(item.outlet_id).or_insert_with(|| OutletContribution {
-                    outlet: item.outlet.clone(),
-                    weight: 1.0,
-                    newest: item.published_at,
-                    views: item.views,
-                    views_per_hour: None,
-                    title: item.title.clone(),
-                    url: item.url.clone(),
-                });
-                if item.published_at > entry.newest {
-                    entry.newest = item.published_at;
-                    entry.title = item.title.clone();
-                    entry.url = item.url.clone();
+        for item in &group.items {
+            let entry = per_outlet.entry(item.outlet_id).or_insert_with(|| OutletContribution {
+                outlet: item.outlet.clone(),
+                weight: 1.0,
+                newest: item.published_at,
+                views: item.views,
+                views_per_hour: None,
+                title: item.title.clone(),
+                url: item.url.clone(),
+            });
+            if item.published_at > entry.newest {
+                entry.newest = item.published_at;
+                entry.title = item.title.clone();
+                entry.url = item.url.clone();
+            }
+            if item.kind == SourceKind::Telegram {
+                if let Some(views) = item.views {
+                    entry.views = Some(entry.views.unwrap_or(0).max(views));
+                    entry.views_per_hour =
+                        views_per_hour(samples, item.item_id, item.published_at, now);
                 }
-                if item.kind == SourceKind::Telegram {
-                    if let Some(views) = item.views {
-                        entry.views = Some(entry.views.unwrap_or(0).max(views));
-                        entry.views_per_hour = views_per_hour(samples, item.item_id, item.published_at, now);
-                    }
-                }
-                let flag = any_uncited.entry(item.outlet_id).or_insert(false);
-                *flag = *flag || !item.cited;
             }
+            let flag = any_uncited.entry(item.outlet_id).or_insert(false);
+            *flag = *flag || !item.cited;
+        }
 
-            let coverage: f64 = per_outlet
-                .iter()
-                .map(|(outlet_id, _)| if any_uncited.get(outlet_id).copied().unwrap_or(false) { 1.0 } else { 0.5 })
-                .sum();
+        // Weight is decided per outlet, once every item of that outlet is known: a single
+        // uncited item makes the whole outlet count fully.
+        let outlet_weight = |outlet_id: i64| {
+            if any_uncited.get(&outlet_id).copied().unwrap_or(false) { 1.0 } else { 0.5 }
+        };
+        let coverage: f64 = per_outlet.keys().map(|outlet_id| outlet_weight(*outlet_id)).sum();
 
-            let mut engagement = 0.0;
-            let mut view_count = 0i64;
-            for rate in &rates {
-                if group_of.get(&rate.item_id) != Some(&group_index_of(groups, group)) {
-                    continue;
-                }
-                let baseline = medians.get(&rate.source_id).copied().unwrap_or(1.0).max(1.0);
-                engagement += rate.rate / baseline;
-                view_count += rate.views;
+        let mut outlets: Vec<OutletContribution> = Vec::with_capacity(per_outlet.len());
+        for (outlet_id, mut contribution) in per_outlet {
+            contribution.weight = outlet_weight(outlet_id);
+            outlets.push(contribution);
+        }
+
+        let mut engagement = 0.0;
+        let mut view_count = 0i64;
+        for rate in &rates {
+            if group_of.get(&rate.item_id) != Some(&group_index) {
+                continue;
             }
+            let baseline = medians.get(&rate.source_id).copied().unwrap_or(1.0).max(1.0);
+            engagement += rate.rate / baseline;
+            view_count += rate.views;
+        }
 
-            let age_hours = ((now - group.newest).max(0) as f64) / 3600.0;
-            let freshness = (-age_hours / tau_hours).exp();
+        let age_hours = ((now - group.newest).max(0) as f64) / 3600.0;
+        let freshness = (-age_hours / tau_hours).exp();
 
-            let mut outlets: Vec<OutletContribution> = per_outlet.into_values().collect();
-            for contribution in &mut outlets {
-                contribution.weight = if any_uncited
-                    .get(&outlet_id_of(&outlets, &contribution.outlet))
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    1.0
-                } else {
-                    0.5
-                };
-            }
-
-            ScoredStory {
-                key: group.key.clone(),
-                title: group.title.clone(),
-                score: 0.0,
-                coverage,
-                coverage_norm: 0.0,
-                engagement,
-                engagement_norm: 0.0,
-                freshness,
-                view_count,
-                newest: group.newest,
-                outlets,
-            }
-        })
-        .collect();
+        stories.push(ScoredStory {
+            key: group.key.clone(),
+            title: group.title.clone(),
+            score: 0.0,
+            coverage,
+            coverage_norm: 0.0,
+            engagement,
+            engagement_norm: 0.0,
+            freshness,
+            view_count,
+            newest: group.newest,
+            outlets,
+        });
+    }
 
     let max_coverage = stories.iter().map(|s| s.coverage).fold(0.0, f64::max);
     let max_engagement = stories.iter().map(|s| s.engagement).fold(0.0, f64::max);
@@ -2367,40 +2404,6 @@ pub fn rank(
     });
     stories
 }
-```
-
-**Note to the implementer:** the two helper calls `group_index_of` and `outlet_id_of` above are a
-known wart — they exist only because the closure has no index. Replace the whole `per_outlet`
-weight pass with this simpler shape before running the tests, which removes both helpers:
-
-```rust
-            // Weight is decided per outlet, after all of that outlet's items are known.
-            let outlet_weight = |outlet_id: i64| {
-                if any_uncited.get(&outlet_id).copied().unwrap_or(false) { 1.0 } else { 0.5 }
-            };
-            let coverage: f64 = per_outlet.keys().map(|id| outlet_weight(*id)).sum();
-            let mut outlets: Vec<OutletContribution> = Vec::new();
-            for (outlet_id, mut contribution) in per_outlet {
-                contribution.weight = outlet_weight(outlet_id);
-                outlets.push(contribution);
-            }
-```
-
-And replace the engagement loop's membership test with a direct index captured before the
-closure, by converting the outer `map` into an indexed loop:
-
-```rust
-    let mut stories: Vec<ScoredStory> = Vec::with_capacity(groups.len());
-    for (group_index, group) in groups.iter().enumerate() {
-        // ... same body ...
-            for rate in &rates {
-                if group_of.get(&rate.item_id) != Some(&group_index) {
-                    continue;
-                }
-                // ... engagement accumulation ...
-            }
-        // ... push ScoredStory ...
-    }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
