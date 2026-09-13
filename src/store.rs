@@ -289,6 +289,116 @@ impl Store {
     pub fn item_count(&self) -> Result<i64, StoreError> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?)
     }
+
+    /// Items and the view samples belonging to those items, for a time range.
+    /// Samples are selected by their item, not their own timestamp, so a sample taken
+    /// outside the range still describes an item inside it.
+    pub fn window_data(
+        &self,
+        from: i64,
+        to: i64,
+        allow_backfill: bool,
+    ) -> Result<(Vec<ItemRow>, Vec<Sample>), StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.id, i.source_id, i.outlet_id, o.name, s.kind, i.title, i.description,
+                    i.url, i.published_at, i.views, i.cited, i.is_backfill
+             FROM items i
+             JOIN sources s ON s.id = i.source_id
+             JOIN outlets o ON o.id = i.outlet_id
+             WHERE i.published_at >= ?1 AND i.published_at <= ?2
+               AND (?3 = 1 OR i.is_backfill = 0)
+               AND s.enabled = 1
+             ORDER BY i.published_at DESC",
+        )?;
+        let mapped = stmt.query_map(rusqlite::params![from, to, allow_backfill as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, i64>(11)?,
+            ))
+        })?;
+        let mut items = Vec::new();
+        for row in mapped {
+            let (
+                item_id, source_id, outlet_id, outlet, kind, title, description, url,
+                published_at, views, cited, is_backfill,
+            ) = row?;
+            let Some(kind) = SourceKind::parse(&kind) else { continue };
+            items.push(ItemRow {
+                item_id,
+                source_id,
+                outlet_id,
+                outlet,
+                kind,
+                title,
+                description,
+                url,
+                published_at,
+                views,
+                cited: cited != 0,
+                is_backfill: is_backfill != 0,
+            });
+        }
+
+        let mut sample_stmt = self.conn.prepare(
+            "SELECT v.item_id, v.ts, v.views
+             FROM view_samples v
+             JOIN items i ON i.id = v.item_id
+             JOIN sources s ON s.id = i.source_id
+             WHERE i.published_at >= ?1 AND i.published_at <= ?2
+               AND (?3 = 1 OR i.is_backfill = 0)
+               AND s.enabled = 1",
+        )?;
+        let samples = sample_stmt
+            .query_map(rusqlite::params![from, to, allow_backfill as i64], |r| {
+                Ok(Sample {
+                    item_id: r.get(0)?,
+                    ts: r.get(1)?,
+                    views: r.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((items, samples))
+    }
+
+    /// Convenience wrapper for a named window ending at `now`.
+    pub fn window(
+        &self,
+        window: Window,
+        now: i64,
+    ) -> Result<(Vec<ItemRow>, Vec<Sample>), StoreError> {
+        self.window_data(now - window.seconds(), now, window.allows_backfill())
+    }
+
+    /// Record the current view count of every Telegram item, at most once per ten minutes
+    /// per item. Telegram only exposes counts for a limited window, so a missed sample is lost.
+    pub fn sample_views(&mut self, now: i64) -> Result<usize, StoreError> {
+        let inserted = self.conn.execute(
+            "INSERT INTO view_samples (item_id, ts, views)
+             SELECT i.id, ?1, i.views
+             FROM items i JOIN sources s ON s.id = i.source_id
+             WHERE s.kind = 'telegram' AND i.views IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM view_samples v WHERE v.item_id = i.id AND v.ts > ?1 - 600
+               )",
+            [now],
+        )?;
+        Ok(inserted)
+    }
+
+    pub fn prune_samples(&mut self, before: i64) -> Result<usize, StoreError> {
+        Ok(self.conn.execute("DELETE FROM view_samples WHERE ts < ?1", [before])?)
+    }
 }
 
 /// Single outlet lookup, shared by `resolve_outlet` and the upsert transaction
@@ -337,6 +447,28 @@ mod tests {
         let mut store = Store::open_in_memory().expect("memory store");
         let source_id = store.ensure_source(&spec("APA", "APA RSS", "https://apa.az/rss"), true).unwrap();
         (store, source_id)
+    }
+
+    fn telegram_fixture() -> (Store, i64) {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .ensure_source(
+                &SourceSpec {
+                    kind: SourceKind::Telegram,
+                    outlet: "Day.az".to_string(),
+                    name: "Day.az Telegram".to_string(),
+                    locator: "@dayaz".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+        (store, id)
+    }
+
+    fn telegram_item(id: &str, views: i64, published_at: i64) -> ParsedItem {
+        let mut item = item(id, "Başlıq", published_at);
+        item.views = Some(views);
+        item
     }
 
     #[test]
@@ -499,5 +631,96 @@ mod tests {
     fn outlet_key_folds_and_strips_punctuation() {
         assert_eq!(outlet_key("Report.az"), outlet_key("report"));
         assert_eq!(outlet_key("APA"), outlet_key("apa"));
+    }
+
+    #[test]
+    fn window_excludes_backfill_for_short_windows_only() {
+        let mut store = Store::open_in_memory().unwrap();
+        let rss = store.ensure_source(&spec("APA", "APA RSS", "https://apa.az/rss"), true).unwrap();
+        let seed = store
+            .ensure_source(
+                &SourceSpec {
+                    kind: SourceKind::Google,
+                    outlet: "Google News".to_string(),
+                    name: "Google News 7d".to_string(),
+                    locator: "google:7d".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+        let now = 1_700_000_000;
+        store.upsert_items(rss, &[item("live", "Canlı xəbər", now - 60)], now).unwrap();
+        store.upsert_items(seed, &[item("seed", "Köhnə xəbər", now - 3600)], now).unwrap();
+
+        let (day_items, _) = store.window(Window::Day, now).unwrap();
+        assert_eq!(day_items.len(), 1, "backfill must not appear in the 24h window");
+        assert_eq!(day_items[0].title, "Canlı xəbər");
+
+        let (week_items, _) = store.window(Window::Week, now).unwrap();
+        assert_eq!(week_items.len(), 2, "backfill is admitted in the 7d window");
+    }
+
+    #[test]
+    fn windowed_items_carry_their_outlet_and_kind() {
+        let (mut store, id) = telegram_fixture();
+        let now = 1_700_000_000;
+        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+
+        let (rows, _) = store.window(Window::Hour, now).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outlet, "Day.az");
+        assert_eq!(rows[0].kind, SourceKind::Telegram);
+        assert_eq!(rows[0].views, Some(500));
+        assert!(!rows[0].is_backfill);
+    }
+
+    #[test]
+    fn disabled_sources_drop_out_of_the_window() {
+        let (mut store, id) = telegram_fixture();
+        let now = 1_700_000_000;
+        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store.set_enabled(id, false).unwrap();
+        let (rows, _) = store.window(Window::Hour, now).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn samples_are_recorded_once_per_throttle_window() {
+        let (mut store, id) = telegram_fixture();
+        let now = 1_700_000_000;
+        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+
+        assert_eq!(store.sample_views(now).unwrap(), 1);
+        // Same item, five minutes later: inside the ten-minute throttle, so no new row.
+        assert_eq!(store.sample_views(now + 300).unwrap(), 0);
+        assert_eq!(store.sample_views(now + 900).unwrap(), 1);
+    }
+
+    #[test]
+    fn samples_are_read_back_for_the_window_that_owns_the_item() {
+        let (mut store, id) = telegram_fixture();
+        let now = 1_700_000_000;
+        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store.sample_views(now).unwrap();
+
+        let (_, samples) = store.window(Window::Hour, now).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].views, 500);
+    }
+
+    #[test]
+    fn prune_removes_only_samples_older_than_the_cutoff() {
+        let (mut store, id) = telegram_fixture();
+        let now = 1_700_000_000;
+        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store.sample_views(now).unwrap();
+        store.sample_views(now + 900).unwrap();
+
+        assert_eq!(store.prune_samples(now + 600).unwrap(), 1);
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM view_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 }
