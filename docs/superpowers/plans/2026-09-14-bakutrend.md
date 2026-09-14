@@ -4703,6 +4703,10 @@ fn run_tui(
     nudge: &mpsc::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
+        // The app's clock is injected, so the loop advances it once per iteration. Without
+        // this, a refresh triggered by a keypress or by a poll result would rank against a
+        // stale reference time.
+        app.set_now(chrono::Utc::now().timestamp());
         terminal.draw(|frame| {
             let view = app.view();
             bakutrend::ui::draw(frame, &view);
