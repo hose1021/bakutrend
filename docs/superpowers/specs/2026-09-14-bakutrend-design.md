@@ -239,6 +239,14 @@ Azerbaijani outlets repost each other constantly. During research, `qafqazinfo` 
 
 Detection is a regex over the description for citation markers: `istinadən`, `istinadla`, `-a istinadla`, `-yə istinadla`, `məlumatına görə`, plus explicit outlet names. A flagged item sets `cited = 1`.
 
+**Correction, made after implementation:** the shipped detector matches citation MORPHOLOGY only
+and does NOT treat a bare outlet name as a marker. Matching a name on its own would halve the
+coverage weight of any story that merely mentions an outlet — a far larger corruption of the
+central signal than the reposts it would catch. An outlet-name marker is only correct in a form
+that already carries a citation verb, which the morphological markers above already cover. The
+detector is shared by all three source kinds, so an Azerbaijani Telegram repost is discounted the
+same way an article feed's is.
+
 Effect on coverage: for each outlet, its weight is `1.0` if it has any uncited item in the window, otherwise `0.5`. An outlet's weight is taken once (the maximum over its items), never summed per item.
 
 ### 8.4 Idempotency
@@ -328,7 +336,14 @@ Toggled with `l`, off by default. It is a **heuristic**: the default view is eve
 
 **Empty state.** If the active window holds fewer than 3 stories, the list shows the most recent stories under a visible banner: `Quiet hour — showing the latest 12 stories instead`. The app never silently displays a different time range than the one it claims.
 
-**Degradation.** The header always reports `n/20 sources ok`. A source that has failed repeatedly backs off exponentially up to 30 minutes and is named in the help overlay, so a quietly broken feed is discoverable rather than invisible.
+**Degradation.** The header reports `n/N sources ok`, where N counts the ENABLED, non-Google
+sources — 19 with the shipped defaults, 20 if `@apatv` is re-enabled, and anything else for a
+custom source list. A deliberately disabled source cannot be "ok", so counting it would pin the
+header below full forever and read as a permanent failure; the Google seed is excluded because it
+is never polled per cycle. Before the first poll completes, health is unknown and the header says
+so rather than claiming every source is up. A source that has failed repeatedly backs off
+exponentially up to 30 minutes and is named in the help overlay, so a quietly broken feed is
+discoverable rather than invisible.
 
 **Text.** Headlines render as published in Azerbaijani, Russian or English. Truncation uses `unicode-width`, never byte or `char` counts.
 
