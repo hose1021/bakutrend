@@ -323,6 +323,7 @@ mod tests {
                     published_at: 1_700_000_000,
                     views: None,
                     cited: false,
+                    cited_outlet: None,
                     publisher: None,
                 }],
                 skipped: 0,

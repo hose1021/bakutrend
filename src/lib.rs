@@ -3,6 +3,7 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 pub mod dirs;
+pub mod embed;
 pub mod error;
 pub mod poller;
 pub mod score;

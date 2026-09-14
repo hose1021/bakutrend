@@ -8,7 +8,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use crate::cluster::{Clusterer, Group};
 use crate::config::Config;
 use crate::poller::PollReport;
-use crate::score::{ScoredStory, rank};
+use crate::score::{Baselines, ScoredStory, rank};
 use crate::store::{ItemRow, Sample, Store, Window};
 use crate::text::matches_any;
 use crate::ui::View;
@@ -22,6 +22,11 @@ const FALLBACK_LIMIT: usize = 12;
 
 /// The tick re-ranks at most once per this many seconds of injected time (I2).
 const REFRESH_INTERVAL_SECS: i64 = 60;
+
+/// How far back channel baselines are measured. A week gives a busy channel hundreds of rated
+/// posts and a quiet one enough to clear the minimum, while staying recent enough to describe
+/// how the channel behaves now.
+const BASELINE_SECONDS: i64 = 7 * 86_400;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -105,7 +110,6 @@ impl App {
     /// Regroup and rerank. Called when data or the window changes, not on every tick.
     pub fn refresh(&mut self, now: i64) {
         self.now = now;
-        let clusterer = Clusterer::new(self.config.cluster_threshold);
         let span = self.window.seconds();
         // One grouping over the full context range `[now - 2*span, now]`: a story's key
         // must not depend on which window is active, and the current and previous
@@ -117,13 +121,24 @@ impl App {
             self.status = "database read failed".to_string();
             return;
         };
+        let embeddings = self.load_embeddings(now - 2 * span, now);
+        let clusterer = Clusterer::new(self.config.cluster_threshold)
+            .with_semantic(self.config.semantic_threshold, embeddings);
         let groups = clusterer.group_items(&context);
+        let baselines = self.baselines(now);
 
         self.quiet_fallback = false;
         let current = window_slice(&groups, now - span, now);
         let stories = self.apply_filters(
             &current,
-            rank(&current, &samples, self.window, &self.config.weights, now),
+            rank(
+                &current,
+                &samples,
+                &baselines,
+                self.window,
+                &self.config.weights,
+                now,
+            ),
         );
 
         // Spec §11: fewer than three stories is quiet — fall back to the latest stories
@@ -143,6 +158,7 @@ impl App {
                 rank(
                     &latest,
                     &week_samples,
+                    &baselines,
                     Window::Week,
                     &self.config.weights,
                     now,
@@ -155,9 +171,36 @@ impl App {
             return;
         }
 
-        self.deltas = self.compute_deltas(&groups, &samples, now, &stories);
+        self.deltas = self.compute_deltas(&groups, &samples, &baselines, now, &stories);
         self.stories = stories;
         self.selected = self.selected.min(self.stories.len().saturating_sub(1));
+    }
+
+    /// Channel baselines, read from a week of history rather than from the active window.
+    ///
+    /// A channel's typical pace is a property of the channel, not of the hour being ranked: a
+    /// one-hour sample would fall back to the corpus median for nearly every channel, which is
+    /// exactly the normalization this is supposed to avoid. A read that fails degrades to the
+    /// empty baseline — every ratio stays bounded and the ranking still happens.
+    fn baselines(&self, now: i64) -> Baselines {
+        match self.store.window_data(now - BASELINE_SECONDS, now, true) {
+            Ok((items, samples)) => Baselines::from_items(&items, &samples, now),
+            Err(_) => Baselines::empty(),
+        }
+    }
+
+    /// Cached vectors for the context range, or an empty map when there are none.
+    ///
+    /// The cache names its own model — the most recently written one — so nothing needs
+    /// configuring for this to start working, and two models are never compared by accident.
+    /// No vectors is the ordinary state, and the clusterer then decides lexically.
+    fn load_embeddings(&self, from: i64, to: i64) -> HashMap<i64, Vec<f32>> {
+        let Ok(Some(model)) = self.store.current_embedding_model() else {
+            return HashMap::new();
+        };
+        self.store
+            .embeddings_for_range(from, to, &model)
+            .unwrap_or_default()
     }
 
     /// The local filter matches the story title, each item's description and each outlet
@@ -196,6 +239,7 @@ impl App {
         &self,
         groups: &[Group],
         samples: &[Sample],
+        baselines: &Baselines,
         now: i64,
         current: &[ScoredStory],
     ) -> Option<HashMap<String, i64>> {
@@ -216,6 +260,7 @@ impl App {
             rank(
                 &previous_groups,
                 samples,
+                baselines,
                 self.window,
                 &self.config.weights,
                 now - span,
@@ -499,6 +544,7 @@ mod tests {
             published_at,
             views: None,
             cited: false,
+            cited_outlet: None,
             publisher: None,
         }
     }
@@ -540,6 +586,7 @@ mod tests {
                 published_at: NOW - index as i64 * 600,
                 views: None,
                 cited: false,
+                cited_outlet: None,
                 publisher: None,
             })
             .collect();
@@ -660,18 +707,18 @@ mod tests {
     }
 
     #[test]
-    fn refresh_groups_headlines_sharing_vocabulary_into_one_story() {
+    fn refresh_merges_two_reports_of_one_event_that_share_a_name() {
         let mut store = Store::open_in_memory().unwrap();
         let source_id = seed_source(&mut store);
         let items = vec![
             parsed(
                 "same-a",
-                "Bakıda metro stansiyasında təmir işləri başladı",
+                "İlham Əliyev metro stansiyasında təmir işləri başladı",
                 NOW,
             ),
             parsed(
                 "same-b",
-                "Bakıda metro stansiyasında təmir işləri davam edir",
+                "İlham Əliyev metro stansiyasında təmir işləri davam edir",
                 NOW - 60,
             ),
         ];
@@ -683,6 +730,35 @@ mod tests {
             app.stories.len(),
             1,
             "one event is one story, not one story per item"
+        );
+    }
+
+    /// Spec §12: two headlines can share every word but the one that matters and still be two
+    /// events. A shared city is not evidence that two sentences describe the same thing.
+    #[test]
+    fn refresh_keeps_two_causes_in_one_city_apart() {
+        let mut store = Store::open_in_memory().unwrap();
+        let source_id = seed_source(&mut store);
+        let items = vec![
+            parsed(
+                "weather-a",
+                "Bakıda güclü yağış səbəbindən yollar bağlandı",
+                NOW,
+            ),
+            parsed(
+                "weather-b",
+                "Bakıda güclü külək səbəbindən yollar bağlandı",
+                NOW - 60,
+            ),
+        ];
+        store.upsert_items(source_id, &items, NOW).unwrap();
+
+        let mut app = App::new(store, Config::default(), NOW);
+        app.refresh(NOW);
+        assert_eq!(
+            app.stories.len(),
+            2,
+            "the cause is the news, so a different cause is a different event"
         );
     }
 
@@ -838,7 +914,7 @@ mod tests {
         let items = vec![
             parsed(
                 "old",
-                "Bakıda metro stansiyasında təmir işləri başladı",
+                "Bakıda metro stansiyasında təmir işləri",
                 NOW - DAY - 3600,
             ),
             parsed(

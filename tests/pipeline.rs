@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use bakutrend::cluster::Clusterer;
 use bakutrend::error::FetchError;
 use bakutrend::poller::{Backoff, poll_once};
-use bakutrend::score::{Weights, rank};
+use bakutrend::score::{Baselines, Weights, rank};
 use bakutrend::source::http::Fetcher;
 use bakutrend::source::{ParseOutcome, SourceKind, SourceSpec};
 use bakutrend::store::{SourceRow, Store, Window};
@@ -170,7 +170,14 @@ fn one_poll_ingests_every_source_and_produces_a_ranked_list() {
         "the clusterer grouped something"
     );
 
-    let ranked = rank(&groups, &samples, Window::Week, &Weights::default(), now);
+    let ranked = rank(
+        &groups,
+        &samples,
+        &Baselines::empty(),
+        Window::Week,
+        &Weights::default(),
+        now,
+    );
     assert!(!ranked.is_empty());
     assert!(
         ranked.windows(2).all(|pair| pair[0].score >= pair[1].score),
@@ -182,8 +189,15 @@ fn one_poll_ingests_every_source_and_produces_a_ranked_list() {
     );
     assert!(!ranked[0].outlets.is_empty());
     assert!(
-        ranked.iter().all(|s| s.coverage >= 0.5),
+        ranked.iter().all(|s| s.spread >= 1),
         "every story has someone carrying it"
+    );
+    // Coverage counts independent origins, so it can never exceed the number of outlets
+    // carrying the story — and it can legitimately be zero when every carrier is a repeat that
+    // names the outlet it took the story from.
+    assert!(
+        ranked.iter().all(|s| s.coverage <= s.spread as f64),
+        "independent origins can never outnumber the outlets carrying the story"
     );
 }
 
@@ -207,6 +221,7 @@ fn the_same_poll_run_twice_reranks_identically() {
         rank(
             &Clusterer::new(0.45).group_items(&items),
             &samples,
+            &Baselines::empty(),
             Window::Week,
             &Weights::default(),
             now,

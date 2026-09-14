@@ -1,6 +1,7 @@
 //! SQLite persistence. `items` and `view_samples` are the only sources of truth;
 //! stories are derived in memory by `cluster` and `score`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension};
@@ -42,6 +43,10 @@ pub struct ItemRow {
     pub published_at: i64,
     pub views: Option<i64>,
     pub cited: bool,
+    /// The outlet this item credits, folded, when a citation marker named one. `None` means
+    /// either that the item is original reporting or that the citation does not say who it
+    /// credits — `cited` distinguishes those two, and coverage treats them differently.
+    pub cited_outlet: Option<String>,
     pub is_backfill: bool,
 }
 
@@ -85,6 +90,18 @@ impl Window {
         matches!(self, Window::Week)
     }
 
+    /// The recent sub-window over which a story's spread is measured. Deliberately not one
+    /// fixed ratio of the window: inside an hour, twenty minutes is the news cycle, while
+    /// inside a day four hours is already old news, and a day is what makes a week's spread
+    /// current.
+    pub fn spread_seconds(self) -> i64 {
+        match self {
+            Window::Hour => 20 * 60,
+            Window::Day => 4 * 3600,
+            Window::Week => 24 * 3600,
+        }
+    }
+
     pub fn all() -> [Window; 3] {
         [Window::Hour, Window::Day, Window::Week]
     }
@@ -126,6 +143,7 @@ CREATE TABLE IF NOT EXISTS items (
   last_seen    INTEGER NOT NULL,
   views        INTEGER,
   cited        INTEGER NOT NULL DEFAULT 0,
+  cited_outlet TEXT,
   is_backfill  INTEGER NOT NULL DEFAULT 0,
   UNIQUE(source_id, external_id)
 );
@@ -138,7 +156,35 @@ CREATE TABLE IF NOT EXISTS view_samples (
   views   INTEGER NOT NULL,
   PRIMARY KEY (item_id, ts)
 );
+
+-- Optional semantic similarity. Keyed by model as well as item, because two models produce
+-- vectors in different spaces and a single cached vector would silently compare across them.
+CREATE TABLE IF NOT EXISTS embeddings (
+  item_id    INTEGER NOT NULL REFERENCES items(id),
+  model      TEXT NOT NULL,
+  dim        INTEGER NOT NULL,
+  vector     BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (item_id, model)
+);
 "#;
+
+/// Additive migrations for a database created by an earlier version. `CREATE TABLE IF NOT
+/// EXISTS` never alters an existing table, so a column added to [`SCHEMA`] reaches a fresh
+/// database and no other; every addition needs its own guarded `ALTER TABLE` here. The
+/// column is nullable and every reader treats `NULL` as "unknown", so an unmigrated row
+/// keeps working instead of failing.
+fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(items)")?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    if !columns.iter().any(|name| name == "cited_outlet") {
+        conn.execute_batch("ALTER TABLE items ADD COLUMN cited_outlet TEXT")?;
+    }
+    Ok(())
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -166,6 +212,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -258,8 +305,9 @@ impl Store {
             };
             tx.execute(
                 "INSERT INTO items (source_id, outlet_id, external_id, url, title, description,
-                                    section, published_at, first_seen, last_seen, views, cited, is_backfill)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)
+                                    section, published_at, first_seen, last_seen, views, cited,
+                                    cited_outlet, is_backfill)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(source_id, external_id) DO UPDATE SET
                    outlet_id = excluded.outlet_id,
                    last_seen = excluded.last_seen,
@@ -273,6 +321,7 @@ impl Store {
                      ELSE items.views
                    END,
                    cited = excluded.cited,
+                   cited_outlet = excluded.cited_outlet,
                    is_backfill = excluded.is_backfill",
                 rusqlite::params![
                     source_id,
@@ -286,6 +335,7 @@ impl Store {
                     now,
                     item.views,
                     item.cited as i64,
+                    item.cited_outlet,
                     is_backfill as i64,
                 ],
             )?;
@@ -320,7 +370,7 @@ impl Store {
     ) -> Result<(Vec<ItemRow>, Vec<Sample>), StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.source_id, i.outlet_id, o.name, s.kind, i.title, i.description,
-                    i.url, i.published_at, i.views, i.cited, i.is_backfill
+                    i.url, i.published_at, i.views, i.cited, i.cited_outlet, i.is_backfill
              FROM items i
              JOIN sources s ON s.id = i.source_id
              JOIN outlets o ON o.id = i.outlet_id
@@ -342,7 +392,8 @@ impl Store {
                 r.get::<_, i64>(8)?,
                 r.get::<_, Option<i64>>(9)?,
                 r.get::<_, i64>(10)?,
-                r.get::<_, i64>(11)?,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, i64>(12)?,
             ))
         })?;
         let mut items = Vec::new();
@@ -359,6 +410,7 @@ impl Store {
                 published_at,
                 views,
                 cited,
+                cited_outlet,
                 is_backfill,
             ) = row?;
             let Some(kind) = SourceKind::parse(&kind) else {
@@ -376,6 +428,7 @@ impl Store {
                 published_at,
                 views,
                 cited: cited != 0,
+                cited_outlet,
                 is_backfill: is_backfill != 0,
             });
         }
@@ -409,6 +462,122 @@ impl Store {
         now: i64,
     ) -> Result<(Vec<ItemRow>, Vec<Sample>), StoreError> {
         self.window_data(now - window.seconds(), now, window.allows_backfill())
+    }
+
+    /// The model of the most recently written vector, or `None` when the cache is empty.
+    ///
+    /// The cache names itself so that nothing needs configuring for it to be used, and so two
+    /// models are never loaded into one comparison by accident — vectors from different models
+    /// live in different spaces and their cosine is meaningless.
+    pub fn current_embedding_model(&self) -> Result<Option<String>, StoreError> {
+        let model = self
+            .conn
+            .query_row(
+                "SELECT model FROM embeddings ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(model)
+    }
+
+    /// Cached embedding vectors for the items of a range, for one model.
+    ///
+    /// An empty map is the normal answer, not an error: vectors are written by the poller
+    /// after ingestion, and a database that has never run with a provider has none. Every
+    /// caller must therefore treat a missing vector as "cluster this item lexically".
+    pub fn embeddings_for_range(
+        &self,
+        from: i64,
+        to: i64,
+        model: &str,
+    ) -> Result<HashMap<i64, Vec<f32>>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.item_id, e.vector
+             FROM embeddings e
+             JOIN items i ON i.id = e.item_id
+             WHERE i.published_at >= ?1 AND i.published_at <= ?2 AND e.model = ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![from, to, model], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (item_id, bytes) = row?;
+            // A vector that no longer decodes is one corrupt row, not a reason to fail the
+            // whole refresh: that item simply clusters lexically.
+            if let Some(vector) = crate::embed::from_bytes(&bytes) {
+                out.insert(item_id, vector);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Store vectors for one model. `INSERT OR REPLACE` makes a re-embed idempotent rather
+    /// than an error, so a crashed batch can simply be repeated.
+    pub fn save_embeddings(
+        &mut self,
+        model: &str,
+        rows: &[(i64, Vec<f32>)],
+        now: i64,
+    ) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        for (item_id, vector) in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO embeddings (item_id, model, dim, vector, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    item_id,
+                    model,
+                    vector.len() as i64,
+                    crate::embed::to_bytes(vector),
+                    now
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Texts still lacking a vector for `model`, newest first, capped at `limit`.
+    ///
+    /// Newest first because the short windows rank on recent items: embedding the newest
+    /// rows makes the semantic path useful immediately, while an oldest-first backfill would
+    /// spend its budget on history the user is not looking at. The cap is what keeps one
+    /// cycle's work bounded when a database is far behind.
+    pub fn items_missing_embeddings(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.id, i.title, i.description
+             FROM items i
+             WHERE NOT EXISTS (
+                     SELECT 1 FROM embeddings e WHERE e.item_id = i.id AND e.model = ?1
+                   )
+             ORDER BY i.published_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![model, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (item_id, title, description) = row?;
+            out.push((
+                item_id,
+                match description {
+                    Some(text) if !text.is_empty() => format!("{title}. {text}"),
+                    _ => title,
+                },
+            ));
+        }
+        Ok(out)
     }
 
     /// Record the current view count of every Telegram item, at most once per ten minutes
@@ -477,6 +646,7 @@ mod tests {
             published_at,
             views: None,
             cited: false,
+            cited_outlet: None,
             publisher: None,
         }
     }
@@ -944,5 +1114,83 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM view_samples", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn a_credited_repost_keeps_the_outlet_it_names() {
+        let (mut store, id) = fixture();
+        let mut credited = item("c1", "Yanğın söndürülüb", 1_000);
+        credited.cited = true;
+        credited.cited_outlet = Some("apa".to_string());
+        let plain = item("c2", "Yanğın söndürülüb - FOTO", 1_100);
+        store.upsert_items(id, &[credited, plain], 1_100).unwrap();
+
+        let (items, _) = store.window_data(0, 2_000, true).unwrap();
+        let credited = items
+            .iter()
+            .find(|row| row.title == "Yanğın söndürülüb")
+            .unwrap();
+        assert!(credited.cited);
+        assert_eq!(credited.cited_outlet.as_deref(), Some("apa"));
+
+        let plain = items
+            .iter()
+            .find(|row| row.title == "Yanğın söndürülüb - FOTO")
+            .unwrap();
+        assert!(!plain.cited);
+        assert_eq!(
+            plain.cited_outlet, None,
+            "original reporting credits nobody"
+        );
+    }
+
+    /// A database written by a version without `cited_outlet`. `CREATE TABLE IF NOT EXISTS`
+    /// leaves an existing table alone, so the column can only arrive by migration — and the rows
+    /// already in the table must survive it.
+    #[test]
+    fn a_database_from_before_cited_outlet_gains_the_column_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE outlets (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, key TEXT NOT NULL);
+                 CREATE TABLE sources (
+                   id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+                   kind TEXT NOT NULL, name TEXT NOT NULL, locator TEXT NOT NULL,
+                   enabled INTEGER NOT NULL DEFAULT 1, UNIQUE(kind, locator));
+                 CREATE TABLE items (
+                   id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id),
+                   outlet_id INTEGER NOT NULL REFERENCES outlets(id), external_id TEXT NOT NULL,
+                   url TEXT NOT NULL, title TEXT NOT NULL, description TEXT, section TEXT,
+                   published_at INTEGER NOT NULL, first_seen INTEGER NOT NULL,
+                   last_seen INTEGER NOT NULL, views INTEGER, cited INTEGER NOT NULL DEFAULT 0,
+                   is_backfill INTEGER NOT NULL DEFAULT 0, UNIQUE(source_id, external_id));
+                 INSERT INTO outlets (id, name, key) VALUES (1, 'APA', 'apa');
+                 INSERT INTO sources (id, outlet_id, kind, name, locator, enabled)
+                   VALUES (1, 1, 'rss', 'APA RSS', 'https://apa.az/rss', 1);
+                 INSERT INTO items (id, source_id, outlet_id, external_id, url, title,
+                                    published_at, first_seen, last_seen, cited)
+                   VALUES (1, 1, 1, 'x', 'https://apa.az/x', 'Köhnə sətir', 100, 100, 100, 1);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let (items, _) = store.window_data(0, 1_000, true).unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "the row written before the migration survives"
+        );
+        assert!(items[0].cited, "its flags are untouched");
+        assert_eq!(
+            items[0].cited_outlet, None,
+            "an origin that was never recorded stays unknown, and is read as such"
+        );
+
+        // Opening again must not try to add the column twice.
+        let again = Store::open(&path).unwrap();
+        assert_eq!(again.window_data(0, 1_000, true).unwrap().0.len(), 1);
     }
 }

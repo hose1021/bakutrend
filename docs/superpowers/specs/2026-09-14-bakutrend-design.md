@@ -41,7 +41,7 @@ Existing news readers give a chronological firehose, not a ranked answer. Google
 ## 4. Non-goals
 
 - No translation. Headlines render as published (Azerbaijani, Russian or English); UI chrome is English.
-- No machine learning, embeddings or vector search.
+- No learned models and no hosted AI service. Clustering has an optional embedding interface (§9), but nothing in this repository implements it, so the shipped system is lexical and deterministic.
 - No non-interactive **ranking output** mode: no `--top`, no JSON on stdout. Ranking is a pure function, so a printer can be added later without rework. `--poll-only` (§12) is not an exception — it produces no ranking output, it only keeps history accumulating.
 - No category filtering UI, no notifications, no article full-text reading, no images.
 - No reading of article bodies. Only feed metadata, Telegram post text and view counts.
@@ -247,7 +247,17 @@ that already carries a citation verb, which the morphological markers above alre
 detector is shared by all three source kinds, so an Azerbaijani Telegram repost is discounted the
 same way an article feed's is.
 
-Effect on coverage: for each outlet, its weight is `1.0` if it has any uncited item in the window, otherwise `0.5`. An outlet's weight is taken once (the maximum over its items), never summed per item.
+**Provenance, since the 2026-09-14 revision.** Each item is classified from its citation flag and the outlet it names, and the three classes weigh differently:
+
+| Provenance | When | Coverage weight |
+|---|---|---|
+| `independent` | no citation marker | 1.0 |
+| `citation` | marker names the outlet it took the story from | 0.0 |
+| `repost` | marker credits nobody | 0.5 |
+
+So `APA` reporting a story and three outlets repeating it with "APA-ya istinadən" is **one independent origin** and four outlets carrying it: coverage 1.0, spread 4. An outlet's weight is the best any of its items reached — one piece of original reporting makes it a source whatever else it also ran — and is taken once, never summed per item. The `repost` half weight is the older rule, kept for the case where provenance genuinely cannot be established.
+
+The credited name is extracted from the text on either side of the marker (`APA-ya istinadən`, `сообщает Reuters`), and only a capitalized, non-stopword token counts. On live data that resolves about 60 % of cited items; the rest stay `repost`. Words like `агентство` or `национальная` still slip through, which needs an outlet gazetteer to fix — see §18.
 
 ### 8.4 Idempotency
 
@@ -268,9 +278,23 @@ Two items belong to the same story when they describe the same event.
 
 **Normalization.** Lowercase; strip Azerbaijani diacritics (`ə→e`, `ı→i`, `ş→s`, `ğ→g`, `ç→c`, `ö→o`, `ü→u`; Russian text is left as-is but lowercased); drop punctuation; remove a small Azerbaijani/Russian stopword list; keep tokens of 4 or more characters; also keep proper-noun runs as single tokens.
 
-**Similarity.** Jaccard similarity over token sets. Match when similarity ≥ `cluster.threshold` (default `0.45`) or when two items share ≥ 2 distinctive proper nouns. The threshold lives in config so real data tunes it.
+**Similarity.** Two routes; a match needs only one.
 
-**Assignment.** New items are compared against stories whose `last_published` falls inside the largest window (7 days). An in-memory inverted index from token to story id means only stories sharing at least one token are compared, rather than every story in the window. On a match the item joins that story and `last_published` advances; otherwise a new story is created with the item's token signature as its `key`.
+*Lexical.* Jaccard similarity over token sets at or above `cluster_threshold` (default `0.40`), **and** at least one of:
+
+- one token set contains the other — the same headline carried with more or less detail, which cannot be a different event;
+- a shared entity that is a person, organization or team, or two shared entities of any kind;
+- one side names nothing at all, so the entity test has nothing to weigh and the lexical score decides alone. Without this, two identical headlines that name nobody would never merge.
+
+*Semantic.* Cosine similarity between the item's vector and the story's centroid, at or above `semantic_threshold` (default `0.80`). This route needs no shared word, and it is the only one that can join two headlines written differently. It is inert unless vectors exist — see Embeddings below.
+
+**Why the entity gate.** `Bakıda güclü yağış səbəbindən yollar bağlandı` and `Bakıda güclü külək səbəbindən yollar bağlandı` share the city and every other word and are two different events: the cause is the news. A shared place is not evidence, so a lexical match needs a named participant or a nested token set. The cost is real and deliberate — two outlets covering the same Baku event in different words, sharing no name, stay apart.
+
+**Assignment.** An in-memory inverted index from token *and* entity to story id means only stories sharing a key are compared. On a match the item joins that story; otherwise a new story is created with the item's token signature as its `key`. An item that has a vector is compared against every story instead, because a semantic match needs no shared key at all.
+
+**No chaining.** A story keeps the tokens and entities of its canonical item — the first, earliest-published one — and never widens them, so every later arrival is compared against that item and never against another arrival. `A ~ B`, `B ~ C`, `A !~ C` therefore cannot collapse into one story. This was already true of the token set before the revision; the revision added the test that pins it. The centroid is the exception and deliberately so: it *is* the mean of the members, which is the right thing to compare against semantically, since a mean resists drift where a growing union would not.
+
+**Embeddings.** `src/embed.rs` defines `EmbeddingProvider`, the `cosine`/`unit`/`centroid` helpers, and a vector cache in SQLite keyed by `(item, model)`; `embed::embed_pending` is the job that fills it; the app reads whatever the cache holds, using the most recently written model, so nothing needs configuring. **No provider is implemented in this repository** — there is no HTTP client for an embedding API and no key handling — so a default build stores no vectors and clusters purely lexically. Wiring one means implementing one trait method and calling `embed_pending` once per poll.
 
 **Representative title.** The title of the story's earliest item, so a story that evolves keeps a stable heading.
 
@@ -280,13 +304,15 @@ Two items belong to the same story when they describe the same event.
 
 For each window $W \in \{1h, 24h, 7d\}$, taking `now` as an injected parameter so ranking is deterministic under test:
 
-$$\text{score} = 0.40 \cdot \widehat{C} + 0.40 \cdot \widehat{E} + 0.20 \cdot F$$
+$$\text{score} = 0.35 \cdot \widehat{C} + 0.35 \cdot \widehat{E} + 0.20 \cdot F + 0.10 \cdot \widehat{S}$$
+
+The weights live in config, and the weighted sum is divided by the total weight, so a config that sets them summing above one still yields a score in $0..1$.
 
 **Candidates.** Stories with at least one contributing item whose `published_at` falls inside $W$, subject to the backfill rule in §8.5.
 
-**Coverage $C$.** Sum over distinct outlets of the outlet weight from §8.3. Normalized: $\widehat{C} = C / \max(C)$ over candidates, guarded against a zero maximum.
+**Coverage $C$.** Sum over distinct outlets of the outlet weight from §8.3 — independent origins only, so repeats count toward spread, never here.
 
-**Engagement $E$.** For each Telegram item in $W$:
+**Engagement $E$.** For each Telegram item:
 
 - `views_per_hour` = (latest sample − first sample) / hours elapsed, when at least two samples exist and at least 10 minutes apart;
 - otherwise the item's total views divided by its age in hours, floored at a quarter hour.
@@ -295,11 +321,17 @@ Both branches therefore measure the same quantity, views per hour. An earlier dr
 the raw view count in the second branch, which mixed units inside a single sum and made the
 engagement term incoherent.
 
-Per-channel normalization divides that by the median `views_per_hour` of the same channel's items in $W$ (floor of 1, to avoid dividing by zero). This is what stops `@qafqazinfo`'s 2.65 K views from automatically beating `@dayaz`'s 340 — without it, the ranking measures subscriber counts, not stories.
+Each rate is divided by its own channel's baseline, then capped at 10. The baseline is the channel's median `views_per_hour` **once it has 20 rated posts**; below that it is the corpus median of all channels, and never below 1 view/hour. The sample floor matters: a median of three posts is a description of those three posts, and one lucky post would set the bar for everything after it.
 
-$E$ is the sum over the story's Telegram items; $\widehat{E}$ normalizes against the window maximum.
+**One outlet, one contribution.** A story's engagement adds up over *outlets*, and an outlet contributes its **fastest post**, not the sum of its posts. Five reposts of one story reach the same readers five times over; before the revision they added up five times. Taking the maximum per channel and then per outlet is written out in the code even though a maximum of maxima is a maximum, because the channel only enters through the baseline its posts are divided by — and a reader needs to see that the step is deliberate, not forgotten.
 
-**Freshness $F$.** $F = \exp(-\text{age}_h / (W_h/3))$, where age is measured from the story's newest item. A story decays within its own window.
+The story's displayed view count is the sum of each outlet's best post, for the same reason.
+
+**Freshness $F$.** $F = \exp(-\text{age}_h/(W_h/3))$, where age is measured from `story_updated_at`: the newest item from an outlet that had **not** carried the story yet. A channel reposting the same headline every five minutes does not keep a dead story at the top. `story_started_at` is the story's earliest item, and the detail pane shows both.
+
+**Spread velocity $S$.** The number of outlets whose *first* item on the story falls inside a sub-window of $W$ — 20 minutes for the hour window, 4 hours for the day, 24 hours for the week. These are not one ratio of the window: within an hour twenty minutes is the news cycle, while within a day four hours is already old news. Each outlet counts once, however often it repeats.
+
+**Normalization.** $\widehat{X} = \min(X / \text{scale}, 1)$, where the scale is the 95th percentile of $X$ across the window's candidates. The maximum is used instead below five candidates, because a percentile of three values is the maximum wearing a hat. A scale of zero yields zero rather than a division. The 95th percentile is the revision's fix for the maximum: one story carried by twenty outlets, or one viral post, otherwise pushes every other story's score toward zero and drains the ranking of information below the leader.
 
 **Delta.** Each story's rank in $W$ is compared with its rank in the immediately preceding window of equal length (computed from `items`, needing no extra storage). The delta column is **hidden entirely** until that preceding window holds enough data to rank; then it renders `+3`, `-1`, or `new`. A column of dashes teaches nothing and costs width.
 
@@ -392,9 +424,10 @@ TDD, red → green, vertical slices at five seams. Fixtures are real captured by
 
 1. **`source::rss::parse(bytes) -> Vec<ParsedItem>`** — one fixture per feed shape: the duplicate-guid feed, the missing-guid feed, the HTML-entity feed, the CDATA-in-escaped-text feed. Assert item counts, timestamps, and that identity keys stay distinct for every item in `qafqazinfo`.
 2. **`source::telegram::parse(html) -> Vec<ParsedItem>`** — real captured preview pages. Assert post ids, datetimes, decoded view counts (`2.65K → 2650`), media-only posts, and posts missing views.
-3. **`cluster::assign(existing, new)`** — same story in different words joins; two different stories sharing a common token stay apart; a syndicated repost joins its original.
-4. **`score::rank(items, window, weights, now)`** — coverage counts **distinct outlets**, not sources; a cited repost contributes 0.5; an outlet with one cited and one uncited item contributes 1.0; per-channel normalization keeps a low-view channel competitive; freshness decays within the window; backfill items are absent from 1 h and 24 h. `now` is injected, so no test depends on wall-clock time.
-5. **`store`** — upserting the same payload twice leaves coverage unchanged (the idempotency invariant); window queries exclude backfill correctly; `view_samples` pruning respects the 30-day boundary.
+3. **`cluster::assign(existing, new)`** — same story in different words joins; two different stories sharing a common token stay apart; a syndicated repost joins its original; a shared city does not merge two causes; two vectors that agree merge headlines sharing no word; no vectors behaves exactly like the lexical clusterer; `A ~ B`, `B ~ C`, `A !~ C` does not chain.
+4. **`score::rank(items, window, weights, now)`** — coverage counts **distinct outlets**, not sources, and only independent origins; five posts by one outlet are one contribution, not five; a channel's baseline needs twenty rated posts and falls back to the corpus median below that; a ratio is capped at ten; a quiet channel's breakout outranks a busy channel's routine post; an outlier cannot flatten the window under p95 normalization; a duplicate repost does not refresh the story; the score is exactly the weighted sum of its four parts; freshness decays within the window; backfill items are absent from 1 h and 24 h. `now` is injected, so no test depends on wall-clock time.
+5. **`store`** — upserting the same payload twice leaves coverage unchanged (the idempotency invariant); window queries exclude backfill correctly; `view_samples` pruning respects the 30-day boundary; a database written before `cited_outlet` existed gains the column and keeps its rows.
+6. **`embed`** — the cache is filled once and the provider is never asked twice; a provider that answers with the wrong number of vectors is an error, not a silent mismatch; a run with nothing to embed never calls the provider; the limit bounds one call.
 
 Existing tests are inline `#[cfg(test)] mod tests`, the dominant convention in `ttymap` (63 modules), with `use super::*;` first.
 
@@ -434,14 +467,17 @@ Each earns its place: `feed-rs` handles the four real-world malformation traps i
 - **Syndication detection is lexical.** Citation phrasing varies; the regex will miss some reposts and will not misattribute originators, because it never tries to identify them.
 - **The local filter is a keyword heuristic.** It will let some world news through when a local institution is mentioned in passing, and will drop some local news that uses unfamiliar place names.
 - **Google News is used as a seed only,** one `when:7d` request on an empty database. Its terms permit personal feed-reader use; bakutrend does not depend on it for ongoing ranking.
-- **Clustering is lexical.** Two outlets describing the same event with no shared vocabulary stay separate stories. This is the accepted trade-off of not using embeddings; if live data shows it failing badly, embeddings slot in behind the same `assign` interface.
+- **Clustering is lexical.** Two outlets describing the same event with no shared vocabulary stay separate stories. This is the accepted trade-off of not using embeddings; if live data shows it failing badly, embeddings slot in behind the same `assign` interface. The revision narrowed this further on purpose: a lexical match now needs a shared **name** or one headline nested inside the other, so two outlets covering the same Baku event in different words and naming nobody stay apart. The embedding route is the designed answer, and it is not wired up.
+- **Cited-outlet extraction is approximate.** The name credited by a citation is read lexically, and on live data it resolves about 60 % of cited items; the rest stay `repost` rather than becoming a `citation` that confirms nothing. Generic nouns survive as false origins (`агентство`, `национальная`), which would need a gazetteer of known outlets to reject — the parser cannot see the `outlets` table.
+- **Channel baselines need history.** A channel with fewer than 20 rated posts is measured against the corpus median, so for the first days of a fresh database the per-channel normalization is coarse. This is the intended degradation, not a bug.
+- **Embeddings cost a full scan when enabled.** With a vector for an item, the clusterer compares it against every group rather than the indexed candidates, because a semantic match shares no key. That is a local cosine over a bounded window and it is off by default; an ANN index or entity-bounded candidates is the upgrade path.
 
 ---
 
 ## 19. Out of scope, deliberately
 
 - Translation API integration.
-- Embedding-based clustering.
+- **A concrete embedding provider.** The interface, the cache and the clustering rule exist and are tested (§9); the HTTP client and key handling do not.
 - Non-interactive output mode.
 - Category filtering UI (the section slug is stored, so it is a zero-migration addition later).
 - Historical comparison beyond the immediately preceding window (e.g. "this week versus last week").

@@ -42,6 +42,10 @@ fn enabled_by_default() -> bool {
 pub struct Config {
     pub poll_interval_secs: u64,
     pub cluster_threshold: f64,
+    /// Cosine similarity at which two items are the same story without sharing a single
+    /// word. Only consulted when embeddings exist; with no provider configured the lexical
+    /// rule decides alone and this value changes nothing.
+    pub semantic_threshold: f64,
     pub weights: Weights,
     pub retention: Retention,
     pub local_keywords: Vec<String>,
@@ -139,7 +143,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             poll_interval_secs: 300,
-            cluster_threshold: 0.45,
+            cluster_threshold: 0.40,
+            semantic_threshold: 0.80,
             weights: Weights::default(),
             retention: Retention::default(),
             local_keywords: LOCAL_KEYWORDS.iter().map(|k| k.to_string()).collect(),
@@ -220,8 +225,10 @@ mod tests {
     fn default_config_matches_the_agreed_values() {
         let config = Config::default();
         assert_eq!(config.poll_interval_secs, 300);
-        assert!((config.cluster_threshold - 0.45).abs() < 1e-9);
-        assert!((config.weights.coverage - 0.40).abs() < 1e-9);
+        assert!((config.cluster_threshold - 0.40).abs() < 1e-9);
+        assert!((config.semantic_threshold - 0.80).abs() < 1e-9);
+        assert!((config.weights.coverage - 0.35).abs() < 1e-9);
+        assert!((config.weights.spread_velocity - 0.10).abs() < 1e-9);
         assert_eq!(config.retention.view_sample_days, 30);
         assert!(config.local_keywords.iter().any(|k| k == "Bakı"));
     }
@@ -269,12 +276,16 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert!((config.weights.coverage - 0.5).abs() < 1e-9);
         assert!(
-            (config.weights.engagement - 0.40).abs() < 1e-9,
+            (config.weights.engagement - 0.35).abs() < 1e-9,
             "an omitted key keeps its default"
         );
         assert!(
             (config.weights.freshness - 0.20).abs() < 1e-9,
             "an omitted key keeps its default"
+        );
+        assert!(
+            (config.weights.spread_velocity - 0.10).abs() < 1e-9,
+            "a weights table written before spread_velocity existed still loads"
         );
     }
 

@@ -69,7 +69,7 @@ pub fn draw(frame: &mut Frame, view: &View<'_>) {
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(6),
-        Constraint::Length(9),
+        Constraint::Length(11),
     ])
     .split(frame.area());
 
@@ -154,6 +154,7 @@ fn draw_list(frame: &mut Frame, view: &View<'_>, area: Rect, selected: usize) {
         Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Length(7),
+        Constraint::Length(6),
         Constraint::Min(20),
         Constraint::Length(8),
     ]);
@@ -163,7 +164,7 @@ fn draw_list(frame: &mut Frame, view: &View<'_>, area: Rect, selected: usize) {
         header.push(Cell::from("Delta"));
     }
     header.extend(
-        ["Score", "Cvg", "Eng", "Fresh", "Headline", "Outlets"]
+        ["Score", "Cvg", "Eng", "Fresh", "Vel", "Headline", "Outlets"]
             .into_iter()
             .map(Cell::from),
     );
@@ -188,6 +189,7 @@ fn draw_list(frame: &mut Frame, view: &View<'_>, area: Rect, selected: usize) {
                 Cell::from(format!("{:.1}", story.coverage)),
                 Cell::from(format!("{:.1}", story.engagement)),
                 Cell::from(format!("{:.2}", story.freshness)),
+                Cell::from(format!("{:.0}", story.spread_velocity)),
                 Cell::from(story.title.clone()),
                 Cell::from(format!("{}", story.outlets.len())),
             ]);
@@ -258,8 +260,22 @@ fn draw_detail(frame: &mut Frame, view: &View<'_>, area: Rect, selected: usize) 
     lines.extend([
         Line::from(story.title.clone()),
         Line::from(format!(
-            "coverage {:.1}   engagement {:.1}   freshness {:.2}   score {:.2}   views {}",
-            story.coverage, story.engagement, story.freshness, story.score, story.view_count
+            "score {:.2}   coverage {:.1} (norm {:.2})   engagement {:.1} (norm {:.2})   freshness {:.2}",
+            story.score,
+            story.coverage,
+            story.coverage_norm,
+            story.engagement,
+            story.engagement_norm,
+            story.freshness
+        )),
+        Line::from(format!(
+            "spread {}   velocity {:.0} (norm {:.2})   started {}   updated {}   views {}",
+            story.spread,
+            story.spread_velocity,
+            story.spread_velocity_norm,
+            relative(view.now, story.started_at),
+            relative(view.now, story.updated_at),
+            story.view_count
         )),
     ]);
     for outlet in &story.outlets {
@@ -267,11 +283,22 @@ fn draw_detail(frame: &mut Frame, view: &View<'_>, area: Rect, selected: usize) 
             .views
             .map(|v| format!("{v} views"))
             .unwrap_or_else(|| "—".to_string());
+        let hourly = outlet
+            .views_per_hour
+            .map(|rate| format!("{rate:.0}/h"))
+            .unwrap_or_else(|| "—".to_string());
+        let velocity = outlet
+            .relative_velocity
+            .map(|ratio| format!("x{ratio:.1}"))
+            .unwrap_or_else(|| "—".to_string());
         lines.push(Line::from(format!(
-            " {}  {}  {}  {}",
+            " {}  {}  {}  {}  {}  {}  {}",
             outlet.outlet,
+            outlet.provenance.label(),
             relative(view.now, outlet.newest),
             views,
+            hourly,
+            velocity,
             outlet.url
         )));
     }
@@ -297,14 +324,21 @@ mod tests {
             engagement: 1.2,
             engagement_norm: 0.8,
             freshness: 0.7,
+            spread: 1,
+            spread_velocity: 1.0,
+            spread_velocity_norm: 1.0,
+            started_at: 0,
+            updated_at: 0,
             view_count: 2650,
             newest: 0,
             outlets: vec![OutletContribution {
                 outlet: "Qafqazinfo".into(),
                 weight: 1.0,
+                provenance: crate::score::Provenance::Independent,
                 newest: 0,
                 views: Some(2650),
                 views_per_hour: Some(900.0),
+                relative_velocity: Some(2.0),
                 title: title.to_string(),
                 url: "https://qafqazinfo.az/news/detail/x-1".into(),
             }],

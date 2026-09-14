@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::error::ParseError;
 use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
-use crate::text::{collapse_ws, decode_entities};
+use crate::text::{cited_outlet, collapse_ws, decode_entities};
 
 pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
     let feed = feed_rs::parser::parse(bytes).map_err(|e| ParseError::Feed(e.to_string()))?;
@@ -48,6 +48,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
             external_id: url.clone(),
             section: section_from_url(&url),
             cited: is_cited(description.as_deref().unwrap_or_default()),
+            cited_outlet: cited_outlet(description.as_deref().unwrap_or_default()),
             url,
             title,
             description,

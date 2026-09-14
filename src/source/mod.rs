@@ -18,6 +18,10 @@ pub struct ParsedItem {
     pub published_at: i64,
     pub views: Option<i64>,
     pub cited: bool,
+    /// The outlet this text credits, folded, when the citation named one. `cited` says a
+    /// repeat happened; this says whose work is being repeated, which is what separates a
+    /// citation that confirms nothing from a repeat nobody can attribute to anyone.
+    pub cited_outlet: Option<String>,
     pub publisher: Option<String>,
 }
 

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::store::ItemRow;
-use crate::text::tokens;
+use crate::text::{Entity, entities, tokens};
 
 /// Jaccard similarity over token sets. Both inputs must be deduplicated; order does
 /// not matter, so a caller cannot silently mis-count by passing unsorted tokens.
@@ -44,6 +44,18 @@ fn group_key(item: &ItemRow, tokens: &[String]) -> String {
     }
 }
 
+/// Keys an item is indexed under: its tokens, plus its entities behind a `#`. The entities
+/// have to be indexed too, because a lexical match now requires a shared name and two items
+/// can share a name without sharing any of the words the tokenizer kept. The prefix keeps the
+/// two namespaces apart — it is unreachable from `tokens`, which only yields alphanumeric runs
+/// — so an entity can never masquerade as a token and make a group look like a candidate for
+/// the wrong reason.
+fn index_keys(tokens: &[String], entities: &[Entity]) -> Vec<String> {
+    let mut keys: Vec<String> = tokens.to_vec();
+    keys.extend(entities.iter().map(|entity| format!("#{}", entity.text)));
+    keys
+}
+
 #[derive(Debug, Clone)]
 pub struct Group {
     pub key: String,
@@ -53,11 +65,23 @@ pub struct Group {
     pub newest: i64,
     pub oldest: i64,
     pub items: Vec<ItemRow>,
+    /// Entities of the group's canonical item — the earliest one. Deliberately not the union
+    /// of its members: a union grows with every arrival, and an item could then join through a
+    /// chain of pairwise agreements that no two members of the group actually share.
+    entities: Vec<Entity>,
+    /// Running sum of the member vectors, so the centroid costs one addition per arrival
+    /// instead of one stored vector per member.
+    embedding_sum: Vec<f32>,
 }
 
 impl Group {
-    fn new(item: &ItemRow, tokens: Vec<String>) -> Self {
-        Self {
+    fn new(
+        item: &ItemRow,
+        tokens: Vec<String>,
+        entities: Vec<Entity>,
+        embedding: Option<&Vec<f32>>,
+    ) -> Self {
+        let mut group = Self {
             key: group_key(item, &tokens),
             title: item.title.clone(),
             tokens,
@@ -65,10 +89,36 @@ impl Group {
             newest: item.published_at,
             oldest: item.published_at,
             items: vec![item.clone()],
+            entities,
+            embedding_sum: Vec::new(),
+        };
+        group.absorb(embedding);
+        group
+    }
+
+    /// Centre of what the group is about, which is what a new item is compared against — not
+    /// one member that happens to be first. `None` when no member had a vector.
+    fn centroid(&self) -> Option<Vec<f32>> {
+        crate::embed::unit(&self.embedding_sum)
+    }
+
+    fn absorb(&mut self, embedding: Option<&Vec<f32>>) {
+        let Some(vector) = embedding else { return };
+        if self.embedding_sum.is_empty() {
+            self.embedding_sum = vec![0.0; vector.len()];
+        }
+        // A vector of another width comes from another model. Adding it would corrupt the mean
+        // rather than refine it, so it is dropped and the centroid stays the mean of the
+        // vectors that agree on a space.
+        if self.embedding_sum.len() != vector.len() {
+            return;
+        }
+        for (sum, x) in self.embedding_sum.iter_mut().zip(vector) {
+            *sum += x;
         }
     }
 
-    fn push(&mut self, item: &ItemRow) {
+    fn push(&mut self, item: &ItemRow, embedding: Option<&Vec<f32>>) {
         self.item_ids.push(item.item_id);
         // `group_items` feeds items oldest first, so this only fires for the public
         // `assign`; either way the title is the earliest published headline.
@@ -78,56 +128,186 @@ impl Group {
         self.newest = self.newest.max(item.published_at);
         self.oldest = self.oldest.min(item.published_at);
         self.items.push(item.clone());
+        self.absorb(embedding);
     }
 }
 
-/// Similarity threshold a caller's non-finite value falls back to.
-const DEFAULT_THRESHOLD: f64 = 0.45;
+/// Lexical threshold a caller's non-finite value falls back to.
+const DEFAULT_THRESHOLD: f64 = 0.40;
+
+/// Semantic threshold a caller's non-finite value falls back to.
+const DEFAULT_SEMANTIC_THRESHOLD: f64 = 0.80;
+
+/// Clamp a threshold into its meaningful range, or take `fallback` for a non-finite value.
+///
+/// Above 1.0 nothing can ever match — similarity tops out at 1.0 — so identical headlines
+/// would stay in separate groups and hand Task 12 duplicate keys. `f64::clamp` alone does not
+/// catch NaN (`f64::NAN.clamp(0.0, 1.0)` is NaN, and every comparison against it is false).
+fn clamp_threshold(threshold: f64, fallback: f64) -> f64 {
+    if threshold.is_finite() {
+        threshold.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
+
+/// True when one token set contains the other: the same headline carried with more, or less,
+/// detail. `Bakıda yollar bağlıdır` and `Bakıda yollar bağlıdır - Sürücülərin nəzərinə` are one
+/// story with a trailing note.
+///
+/// This is the strongest lexical evidence short of equality, and it is deliberately checked
+/// before the entity gate. When every word of the shorter headline appears in the longer one,
+/// the two cannot be describing different events — the difference is detail, not subject. Two
+/// headlines that each carry a word the other lacks are the case worth guarding, and that is
+/// what [`shares_evidence`] decides.
+fn nested(a: &[String], b: &[String]) -> bool {
+    a.iter().all(|token| b.contains(token)) || b.iter().all(|token| a.contains(token))
+}
+
+/// True when two entity sets name something specific in common.
+///
+/// One shared place is deliberately not enough. `Bakıda güclü yağış səbəbindən yollar
+/// bağlandı` and `Bakıda güclü külək səbəbindən yollar bağlandı` share the city and every
+/// other word, and are still two events: the weather is the news. A shared person,
+/// organization or team does name an event; so do two shared names of any kind.
+fn shares_evidence(a: &[Entity], b: &[Entity]) -> bool {
+    // One side names nothing at all, so the gate has nothing to weigh and the token score
+    // decides alone. Refusing here would stop two identical headlines from merging whenever
+    // neither names a place or a person — the most confident match there is.
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+    let mut shared = 0;
+    let mut specific = false;
+    for entity in a {
+        let Some(other) = b.iter().find(|candidate| candidate.text == entity.text) else {
+            continue;
+        };
+        shared += 1;
+        if !entity.kind.is_location() || !other.kind.is_location() {
+            specific = true;
+        }
+    }
+    specific || shared >= 2
+}
 
 pub struct Clusterer {
     threshold: f64,
+    semantic_threshold: f64,
+    embeddings: HashMap<i64, Vec<f32>>,
 }
 
 impl Clusterer {
-    /// Clamp the threshold into its meaningful range. Above 1.0 nothing can ever match —
-    /// similarity tops out at 1.0 — so identical headlines would stay in separate groups and
-    /// hand Task 12 duplicate keys. `f64::clamp` alone does not catch NaN
-    /// (`f64::NAN.clamp(0.0, 1.0)` is NaN, and every comparison against it is false), so
-    /// non-finite values take `DEFAULT_THRESHOLD`.
     pub fn new(threshold: f64) -> Self {
-        let threshold = if threshold.is_finite() {
-            threshold.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_THRESHOLD
-        };
-        Self { threshold }
+        Self {
+            threshold: clamp_threshold(threshold, DEFAULT_THRESHOLD),
+            semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
+            embeddings: HashMap::new(),
+        }
+    }
+
+    /// Add semantic similarity. `embeddings` maps item id to its vector, for whichever items
+    /// the caller managed to embed; an item without one keeps the lexical rule alone, which is
+    /// the normal state of a database that has never run with a provider.
+    ///
+    /// Spec §3: this is additive. Nothing here can make the clusterer fail, and a caller that
+    /// passes an empty map gets exactly the lexical behaviour.
+    pub fn with_semantic(
+        mut self,
+        semantic_threshold: f64,
+        embeddings: HashMap<i64, Vec<f32>>,
+    ) -> Self {
+        self.semantic_threshold = clamp_threshold(semantic_threshold, DEFAULT_SEMANTIC_THRESHOLD);
+        self.embeddings = embeddings;
+        self
+    }
+
+    /// Whether `item` is the same story as `group`.
+    ///
+    /// Three routes, in order of strength. Semantic similarity can join two headlines that
+    /// share no word at all, and is consulted first because it is the strongest evidence — but
+    /// it only exists when a provider produced vectors for both items. A nested token set is
+    /// the same headline with more or less detail. Otherwise the words must overlap enough AND
+    /// something must name the event, which is what keeps two sentences about different events
+    /// from merging on shared vocabulary alone.
+    fn links(
+        &self,
+        item: &ItemRow,
+        item_tokens: &[String],
+        item_entities: &[Entity],
+        group: &Group,
+    ) -> bool {
+        if let (Some(vector), Some(centroid)) =
+            (self.embeddings.get(&item.item_id), group.centroid())
+            && crate::embed::cosine(vector, &centroid) >= self.semantic_threshold
+        {
+            return true;
+        }
+        similarity(item_tokens, &group.tokens) >= self.threshold
+            && (nested(item_tokens, &group.tokens)
+                || shares_evidence(item_entities, &group.entities))
+    }
+
+    /// Every group worth comparing against one item.
+    ///
+    /// With a vector for the item, the index cannot bound the set: a semantic match needs no
+    /// shared word, so any group could match and every one is compared.
+    /// ponytail: O(items x groups) when embeddings are on, which is a local cosine and only
+    /// when a provider is configured. Bound it by entities or an ANN index if that ever hurts.
+    fn candidates(
+        &self,
+        item_id: i64,
+        keys: &[String],
+        index: &HashMap<String, Vec<usize>>,
+        group_count: usize,
+    ) -> Vec<usize> {
+        if self.embeddings.contains_key(&item_id) {
+            return (0..group_count).collect();
+        }
+        let mut indexed: Vec<usize> = Vec::new();
+        for key in keys {
+            if let Some(owners) = index.get(key) {
+                indexed.extend_from_slice(owners);
+            }
+        }
+        indexed.sort_unstable();
+        indexed.dedup();
+        indexed
     }
 
     /// Place `item` in the most similar existing group, or start a new one.
     /// Returns the index of the group it landed in.
     pub fn assign(&self, groups: &mut Vec<Group>, item: &ItemRow) -> usize {
         let item_tokens = tokens(&item.title);
+        let item_entities = entities(&item.title);
+        let embedding = self.embeddings.get(&item.item_id);
         let mut best: Option<(usize, f64)> = None;
         for (index, group) in groups.iter().enumerate() {
+            if !self.links(item, &item_tokens, &item_entities, group) {
+                continue;
+            }
             let score = similarity(&item_tokens, &group.tokens);
-            if score >= self.threshold && best.is_none_or(|(_, top)| score > top) {
+            if best.is_none_or(|(_, top)| score > top) {
                 best = Some((index, score));
             }
         }
         match best {
             Some((index, _)) => {
-                groups[index].push(item);
+                groups[index].push(item, embedding);
                 index
             }
             None => {
-                groups.push(Group::new(item, item_tokens));
+                groups.push(Group::new(item, item_tokens, item_entities, embedding));
                 groups.len() - 1
             }
         }
     }
 
-    /// Group a whole item set. An inverted token index keeps this linear-ish rather than
-    /// quadratic: a new item is only compared against groups sharing at least one token.
+    /// Group a whole item set. An inverted index over tokens and entities keeps this
+    /// linear-ish rather than quadratic: a new item is only compared against groups that share
+    /// a token or a name, which is a complete candidate set for every rule that can match
+    /// without a vector. An item that has one is compared against every group instead, because
+    /// a semantic match needs no shared key at all.
     pub fn group_items(&self, items: &[ItemRow]) -> Vec<Group> {
         let mut groups: Vec<Group> = Vec::new();
         let mut index: HashMap<String, Vec<usize>> = HashMap::new();
@@ -138,44 +318,39 @@ impl Clusterer {
 
         for item in ordered {
             let item_tokens = tokens(&item.title);
-            // The index only covers token-sharing groups, which is a complete candidate set
-            // only while a match requires a shared token. At a non-positive threshold a group
-            // with nothing in common can still match, so fall back to every group and keep the
-            // two entry points in agreement.
-            let candidates: Vec<usize> = if self.threshold <= 0.0 {
-                (0..groups.len()).collect()
-            } else {
-                let mut indexed: Vec<usize> = Vec::new();
-                for token in &item_tokens {
-                    if let Some(owners) = index.get(token) {
-                        indexed.extend_from_slice(owners);
-                    }
-                }
-                indexed.sort_unstable();
-                indexed.dedup();
-                indexed
-            };
+            let item_entities = entities(&item.title);
+            let embedding = self.embeddings.get(&item.item_id);
+            let keys = index_keys(&item_tokens, &item_entities);
+            let candidates = self.candidates(item.item_id, &keys, &index, groups.len());
 
             let mut best: Option<(usize, f64)> = None;
             for group_index in candidates {
+                if !self.links(item, &item_tokens, &item_entities, &groups[group_index]) {
+                    continue;
+                }
                 let score = similarity(&item_tokens, &groups[group_index].tokens);
-                if score >= self.threshold && best.is_none_or(|(_, top)| score > top) {
+                if best.is_none_or(|(_, top)| score > top) {
                     best = Some((group_index, score));
                 }
             }
 
             let group_index = match best {
                 Some((group_index, _)) => {
-                    groups[group_index].push(item);
+                    groups[group_index].push(item, embedding);
                     group_index
                 }
                 None => {
-                    groups.push(Group::new(item, item_tokens.clone()));
+                    groups.push(Group::new(
+                        item,
+                        item_tokens.clone(),
+                        item_entities,
+                        embedding,
+                    ));
                     groups.len() - 1
                 }
             };
-            for token in &item_tokens {
-                index.entry(token.clone()).or_default().push(group_index);
+            for key in keys {
+                index.entry(key).or_default().push(group_index);
             }
         }
         groups
@@ -201,6 +376,7 @@ mod tests {
             published_at,
             views: None,
             cited: false,
+            cited_outlet: None,
             is_backfill: false,
         }
     }
@@ -312,10 +488,13 @@ mod tests {
 
     #[test]
     fn zero_threshold_groups_the_same_through_both_entry_points() {
+        // Threshold 0 drops the requirement that the words overlap. It does not drop the
+        // requirement that something names the event: two headlines with no shared word and no
+        // name in common stay apart, and both entry points must agree on that.
         let clusterer = Clusterer::new(0.0);
         let items = vec![
             item(1, 1, "Bakıda bu yollar bağlıdır", 100),
-            item(2, 2, "Gəncədə toy karvanı qəza etdi", 200),
+            item(2, 2, "Sumqayıtda toy karvanı qəza etdi", 200),
         ];
 
         let mut assigned = Vec::new();
@@ -326,14 +505,22 @@ mod tests {
 
         assert_eq!(
             assigned.len(),
-            1,
-            "at threshold 0 even a disjoint headline matches"
+            2,
+            "similarity alone is not evidence at any threshold"
         );
         assert_eq!(
             grouped.len(),
-            1,
+            assigned.len(),
             "group_items must agree with assign at threshold 0"
         );
+
+        // A shared organization is evidence, so at threshold 0 these merge despite sharing no
+        // word beyond the name itself.
+        let named = vec![
+            item(3, 3, "SOCAR Bakıda yeni layihə", 300),
+            item(4, 4, "SOCAR Gəncədə görüş keçirdi", 400),
+        ];
+        assert_eq!(Clusterer::new(0.0).group_items(&named).len(), 1);
     }
 
     #[test]
@@ -419,9 +606,118 @@ mod tests {
             item(2, 2, "Gəncədə toy karvanı qəza etdi", 200),
         ];
 
-        // 0.6 joins and 0.167 stays apart only at the default 0.45: a NaN threshold would put
+        // 0.6 joins and 0.167 stays apart only at the default 0.40: a NaN threshold would put
         // every item in its own group, and 0.0 would merge both pairs.
         assert_eq!(Clusterer::new(f64::NAN).group_items(&identical).len(), 1);
         assert_eq!(Clusterer::new(f64::NAN).group_items(&unrelated).len(), 2);
+    }
+
+    #[test]
+    fn a_reworded_headline_joins_on_semantics_when_vectors_exist() {
+        // These two share almost nothing: two tokens out of twelve. The lexical rule keeps them
+        // apart at any sane threshold, and vectors that agree join them — which is the whole
+        // point of letting a provider in.
+        let items = vec![
+            item(1, 1, "Sabah Barcelona oyun biletləri satışa çıxacaq", 100),
+            item(
+                2,
+                2,
+                "Barcelona ilə Bakı klubu arasında qarşılaşmaya bilet satışı başlayır",
+                200,
+            ),
+        ];
+
+        let lexical = Clusterer::new(0.40).group_items(&items);
+        assert_eq!(
+            lexical.len(),
+            2,
+            "words alone cannot see that these describe one fixture"
+        );
+
+        let semantic = Clusterer::new(0.40).with_semantic(
+            0.80,
+            HashMap::from([(1, vec![1.0, 0.0]), (2, vec![0.99, 0.1])]),
+        );
+        assert_eq!(
+            semantic.group_items(&items).len(),
+            1,
+            "vectors that agree join headlines that share no word"
+        );
+    }
+
+    #[test]
+    fn no_vectors_is_exactly_the_lexical_clusterer() {
+        // The normal state of a database that has never run with a provider: an empty vector map
+        // must be indistinguishable from never asking for semantic similarity at all.
+        let items = vec![
+            item(1, 1, "Bakıda güclü yağış səbəbindən yollar bağlandı", 100),
+            item(2, 2, "Bakıda güclü külək səbəbindən yollar bağlandı", 200),
+            item(3, 3, "Bakıda bu yollar bağlıdır", 300),
+        ];
+        let plain = Clusterer::new(0.40).group_items(&items);
+        let empty = Clusterer::new(0.40)
+            .with_semantic(0.80, HashMap::new())
+            .group_items(&items);
+        assert_eq!(
+            plain.len(),
+            3,
+            "the two weather headlines share a city and every other word, and are still two \
+             events: neither token set contains the other and only a place is shared"
+        );
+        assert_eq!(
+            plain.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            empty.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            "an empty cache must change nothing"
+        );
+    }
+
+    #[test]
+    fn an_item_joins_what_it_matches_not_what_its_neighbour_matched() {
+        // A matches B, B matches C, and A does not match C. Comparing against the group's
+        // canonical item — its earliest, whose tokens and entities the group keeps and never
+        // widens — is what stops the three collapsing into one story by transitivity.
+        let items = vec![
+            item(1, 1, "Bakıda metro təmir işləri", 100),
+            item(2, 2, "Metro təmir işləri davam edir", 200),
+            item(3, 3, "Təmir işləri davam edir, planlaşdırılır", 300),
+        ];
+        let a = tokens(&items[0].title);
+        let b = tokens(&items[1].title);
+        let c = tokens(&items[2].title);
+        assert!(similarity(&a, &b) >= 0.40, "A and B are one story");
+        assert!(similarity(&b, &c) >= 0.40, "B and C are one story");
+        assert!(
+            similarity(&a, &c) < 0.40,
+            "A and C are not: {}",
+            similarity(&a, &c)
+        );
+
+        let groups = Clusterer::new(0.40).group_items(&items);
+
+        assert_eq!(groups.len(), 2, "C must not ride in on B's coat-tails");
+        assert_eq!(groups[0].item_ids, vec![1, 2]);
+        assert_eq!(groups[1].item_ids, vec![3]);
+    }
+
+    #[test]
+    fn the_centroid_is_the_mean_of_the_members() {
+        // Three near-identical vectors: the centre stays where they agree, which is what a new
+        // item is compared against. The centroid is renormalised, so the value is the unit
+        // vector of the mean, not the raw sum.
+        let items = vec![
+            item(1, 1, "Bakıda metro təmir işləri", 100),
+            item(2, 2, "Bakıda metro təmir işləri davam edir", 200),
+        ];
+        let vectors = HashMap::from([(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])]);
+        let groups = Clusterer::new(0.40)
+            .with_semantic(0.80, vectors)
+            .group_items(&items);
+        assert_eq!(groups.len(), 1);
+        let sum = vec![1.0f32, 1.0];
+        let expected = crate::embed::unit(&sum).unwrap();
+        let actual = groups[0].centroid().unwrap();
+        for (a, b) in actual.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-6, "centroid {actual:?} != {expected:?}");
+        }
     }
 }

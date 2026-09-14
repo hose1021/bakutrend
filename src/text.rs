@@ -1,6 +1,6 @@
 //! Text normalization shared by story grouping, citation detection and the local filter.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Lowercase and strip Azerbaijani diacritics so `Bakı` and `baki` compare equal.
 pub fn fold(input: &str) -> String {
@@ -180,6 +180,260 @@ pub fn matches_any(input: &str, keywords: &[String]) -> bool {
     })
 }
 
+/// A place name carries no event on its own, so it is a weaker grouping signal than
+/// a person or organization, which are what two stories about the same event share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntityKind {
+    Person,
+    Organization,
+    Team,
+    Country,
+    City,
+    Place,
+    Other,
+}
+
+impl EntityKind {
+    /// True for a place name that carries no event on its own (Bakı, Azərbaycan).
+    pub fn is_location(self) -> bool {
+        matches!(
+            self,
+            EntityKind::Country | EntityKind::City | EntityKind::Place
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    pub text: String,
+    pub kind: EntityKind,
+}
+
+/// Gazetteer of names worth tracking, keyed by folded surface form. Azerbaijani,
+/// Russian and English spellings of one name sit under one entry so a headline in any
+/// feed language lands on the same entity. Keys must already be folded: `fold`
+/// lowercases but keeps Cyrillic letters Cyrillic, so a Russian key matches only after
+/// both sides go through `fold`.
+const GAZETTEER: &[(&[&str], EntityKind)] = &[
+    // Azerbaijan: cities and regions.
+    (&["baki", "baku", "баку"], EntityKind::City),
+    (&["sumqayit", "сумгаит"], EntityKind::City),
+    (&["gence", "ganca", "gyandzha", "гянджа"], EntityKind::City),
+    (&["mingecevir", "мингечевир"], EntityKind::City),
+    (&["susa", "shusha", "шуша"], EntityKind::City),
+    (&["xankendi", "khankendi", "степанакерт"], EntityKind::City),
+    (&["lenkeran", "лянкяран"], EntityKind::City),
+    (&["seki", "sheki", "шеки"], EntityKind::City),
+    (&["naxcivan", "nakhchivan", "нахичевань"], EntityKind::City),
+    (&["semkir", "шамкир"], EntityKind::City),
+    (&["sirvan", "ширван"], EntityKind::City),
+    (&["qebele", "кабала"], EntityKind::City),
+    (&["zagatala", "закаталы"], EntityKind::City),
+    (&["berde", "борда"], EntityKind::City),
+    (&["agdam", "агдам"], EntityKind::City),
+    (&["fuzuli", "физули"], EntityKind::City),
+    (&["cebrayil", "джебраил"], EntityKind::City),
+    (&["zengilan", "зангилан"], EntityKind::City),
+    (&["qubadli", "кубатлы"], EntityKind::City),
+    (&["kelbecer", "кельбаджар"], EntityKind::City),
+    (&["quba"], EntityKind::City),
+    (&["salyan", "сальян"], EntityKind::City),
+    (&["qusar", "кусары"], EntityKind::City),
+    (&["neftcala", "нефтчала"], EntityKind::City),
+    (&["bilesuvar", "билесувар"], EntityKind::City),
+    (&["saatli", "саатлы"], EntityKind::City),
+    (&["terter", "тертер"], EntityKind::City),
+    (&["goranboy", "горанбой"], EntityKind::City),
+    (&["gedebey", "гедабек"], EntityKind::City),
+    (&["naftalan", "нафталан"], EntityKind::City),
+    // Countries seen in this feed's news.
+    (
+        &["azerbaycan", "azerbaijan", "азербайджан"],
+        EntityKind::Country,
+    ),
+    (&["turkiye", "turkey", "турция"], EntityKind::Country),
+    (&["rusiya", "russia", "россия"], EntityKind::Country),
+    (&["abs", "usa", "сша"], EntityKind::Country),
+    (&["ukrayna", "ukraine", "украина"], EntityKind::Country),
+    (&["iran", "иран"], EntityKind::Country),
+    (&["israil", "israel", "израиль"], EntityKind::Country),
+    (&["fransa", "france", "франция"], EntityKind::Country),
+    (&["almaniya", "germany", "германия"], EntityKind::Country),
+    (&["ingiltere", "england", "англия"], EntityKind::Country),
+    (&["cin", "kitay", "china", "китай"], EntityKind::Country),
+    (&["ermenistan", "armenia", "армения"], EntityKind::Country),
+    (&["gurcustan", "georgia", "грузия"], EntityKind::Country),
+    // Organizations.
+    (&["socar"], EntityKind::Organization),
+    (&["azal"], EntityKind::Organization),
+    (&["ady"], EntityKind::Organization),
+    (&["uefa", "уефа"], EntityKind::Organization),
+    (&["fifa", "фифа"], EntityKind::Organization),
+    (&["nato", "нато"], EntityKind::Organization),
+    (&["bmt", "оон"], EntityKind::Organization),
+    (&["ai", "еи"], EntityKind::Organization),
+    (&["din"], EntityKind::Organization),
+    (&["xin"], EntityKind::Organization),
+    (&["milli_meclis"], EntityKind::Organization),
+    // Football teams.
+    (&["qarabag", "karabakh", "карабах"], EntityKind::Place),
+    (&["neftci", "нефтчи"], EntityKind::Team),
+    (&["barselona", "barcelona", "барселона"], EntityKind::Team),
+    (&["real_madrid", "реал_мадрид"], EntityKind::Team),
+];
+fn gazetteer_lookup(folded_word: &str) -> Option<(String, EntityKind)> {
+    let hit = |word: &str| {
+        GAZETTEER
+            .iter()
+            .find(|(forms, _)| forms.contains(&word))
+            .map(|(forms, kind)| (forms[0].to_string(), *kind))
+    };
+    // Azerbaijani case endings survive folding (`Bakıda` → `bakida`), so a miss is
+    // retried with one ending stripped, longest first. Only a gazetteer hit counts,
+    // so a wrong strip can never invent an entity the text does not name.
+    hit(folded_word).or_else(|| {
+        [
+            "daki", "deki", "dan", "den", "nin", "nun", "da", "de", "in", "un", "ya", "ye", "a",
+            "e",
+        ]
+        .iter()
+        .filter_map(|suffix| folded_word.strip_suffix(suffix))
+        .filter(|stem| stem.chars().count() >= 3)
+        .find_map(hit)
+    })
+}
+
+/// Named entities in a headline: gazetteer matches plus capitalized proper-noun runs.
+/// `text` is FOLDED (lowercase, no Azerbaijani diacritics, words joined by `_`), so a
+/// caller can compare two headlines' entities directly. Sorted by `text`, deduplicated.
+///
+/// A single capitalized word that is NOT in the gazetteer is deliberately NOT an entity:
+/// sentence-initial capitalization is indistinguishable from a proper name (`Sabah` is
+/// both "tomorrow" and a person's name), so a lone capital carries no signal. Two or
+/// more consecutive capitalized words do count, as kind `Other`. Never uppercase-fold
+/// a token that is entirely non-alphabetic — such tokens are skipped outright.
+pub fn entities(input: &str) -> Vec<Entity> {
+    let mut found: BTreeMap<String, EntityKind> = BTreeMap::new();
+    let words: Vec<&str> = input.split_whitespace().collect();
+
+    // Gazetteer matches: capitalized words only, folded, one lookup per word.
+    for word in &words {
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if bare.chars().next().is_some_and(char::is_uppercase)
+            && bare.chars().any(char::is_alphabetic)
+            && let Some((text, kind)) = gazetteer_lookup(&fold(bare))
+        {
+            found.entry(text).or_insert(kind);
+        }
+    }
+
+    // Proper-noun runs: detected on the raw text, before folding destroys case. A run
+    // also ends after a word that carries trailing punctuation — `Bakı, Azərbaycan`
+    // names two things, not one phrase.
+    let mut run: Vec<&str> = Vec::new();
+    for word in words {
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+        let capitalized = bare.chars().next().is_some_and(char::is_uppercase)
+            && bare.chars().any(char::is_alphabetic);
+        if capitalized {
+            run.push(bare);
+        }
+        if !capitalized || !word.ends_with(char::is_alphanumeric) {
+            if run.len() >= 2 {
+                let text = fold(&run.join(" ")).replace(' ', "_");
+                found.entry(text).or_insert(EntityKind::Other);
+            }
+            run.clear();
+        }
+    }
+
+    found
+        .into_iter()
+        .map(|(text, kind)| Entity { text, kind })
+        .collect()
+}
+
+/// The outlet a text credits, when a citation marker names one. `None` when no marker
+/// is present or the tokens before it hold no usable name — never guess an outlet that
+/// is not written in the text.
+pub fn cited_outlet(input: &str) -> Option<String> {
+    // Mirror of the marker table in `src/source/mod.rs`, which holds the same list for
+    // `is_cited`. text.rs cannot depend on `source` (that would invert the existing
+    // layering: source already depends on text).
+    const CITATION_MARKERS: &[&[&str]] = &[
+        &["istinaden"],
+        &["istinadla"],
+        &["melumatina", "gore"],
+        &["сообщает"],
+        &["передает"],
+        &["ссылаясь"],
+        &["по", "данным"],
+    ];
+
+    let folded = fold(input);
+    let folded_tokens: Vec<&str> = folded
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    // `fold` maps one character to one character, so the folded text splits into the same tokens
+    // as the original, in the same order. The original tokens are kept for their case, which
+    // folding destroys and which is the only thing separating an outlet from the word before it.
+    let original_tokens: Vec<&str> = input
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let (marker_start, marker_len) = CITATION_MARKERS
+        .iter()
+        .filter_map(|marker| {
+            folded_tokens
+                .windows(marker.len())
+                .position(|run| run == *marker)
+                .map(|position| (position, marker.len()))
+        })
+        .min_by_key(|(position, _)| *position)?;
+
+    // A case suffix may hang between the name and the marker: `APA-ya istinadən` folds
+    // to tokens [.., apa, ya, istinaden]. The suffix is its own token, so it is skipped
+    // and the last whole token before it is the bare folded name; quotes were already
+    // dropped by the alphanumeric split.
+    const CASE_SUFFIXES: &[&str] = &[
+        "ya", "ye", "a", "e", "nin", "in", "nun", "un", "da", "de", "dan", "den",
+    ];
+    let mut end = marker_start;
+    while end > 0 && CASE_SUFFIXES.contains(&folded_tokens[end - 1]) {
+        end -= 1;
+    }
+
+    // A citation names its source on whichever side of the marker its language puts it:
+    // Azerbaijani `APA-ya istinadən` puts the name before, Russian `сообщает Reuters` puts it
+    // after. Whichever side has a capitalized word is the side that names the outlet.
+    //
+    // An outlet is a name, and a name is capitalized or quoted. Anything else is the sentence the
+    // marker sits in: `как сообщает` and `тепла передает` are prose, and reading a word of it as a
+    // source would turn an unattributed repeat into a citation that confirms nothing — the one
+    // direction this classification must never move by accident.
+    let indices = [end.checked_sub(1), Some(marker_start + marker_len)];
+    for index in indices.into_iter().flatten() {
+        let Some(name) = folded_tokens.get(index) else {
+            continue;
+        };
+        // A capital at the start of a sentence says nothing: `Как сообщает Reuters` opens with a
+        // capitalized function word. The stopword list is the cheapest guard against reading prose
+        // as a name, and it is already here for tokenization.
+        if name.chars().count() < 2 || STOPWORDS.contains(name) {
+            continue;
+        }
+        let capitalized = original_tokens
+            .get(index)
+            .and_then(|token| token.chars().next())
+            .is_some_and(char::is_uppercase);
+        if capitalized {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +481,98 @@ mod tests {
         );
         assert!(tokens("və bu ki").is_empty());
     }
+
+    #[test]
+    fn entities_finds_a_gazetteer_city_in_each_of_the_three_languages() {
+        for headline in [
+            "Bakıda avtomobil qəzası olub",
+            "В Баку произошла авария",
+            "Traffic accident reported in Baku",
+        ] {
+            let e = entities(headline);
+            assert_eq!(
+                e.first().map(|x| x.text.as_str()),
+                Some("baki"),
+                "all spellings must land on one entity: {headline}"
+            );
+            assert_eq!(e.first().map(|x| x.kind), Some(EntityKind::City));
+        }
+    }
+
+    #[test]
+    fn two_consecutive_capitalized_words_become_one_entity() {
+        assert_eq!(
+            entities("Donald Tramp gəlib çatıb"),
+            vec![Entity {
+                text: "donald_tramp".to_string(),
+                kind: EntityKind::Other,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_lone_non_gazetteer_capitalized_word_is_not_an_entity() {
+        assert!(entities("Sabah yağış gözlənilir").is_empty());
+    }
+
+    #[test]
+    fn entities_output_is_sorted_and_deduplicated() {
+        let e = entities("Bakı və Qarabağ, Bakıda yenə");
+        let texts: Vec<&str> = e.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, vec!["baki", "qarabag"]);
+        assert_eq!(e[0].kind, EntityKind::City);
+        assert_eq!(e[1].kind, EntityKind::Place);
+    }
+
+    #[test]
+    fn is_location_is_true_for_places_and_false_for_actors() {
+        assert!(EntityKind::City.is_location());
+        assert!(EntityKind::Country.is_location());
+        assert!(EntityKind::Place.is_location());
+        assert!(!EntityKind::Person.is_location());
+        assert!(!EntityKind::Organization.is_location());
+        assert!(!EntityKind::Team.is_location());
+    }
+
+    #[test]
+    fn cited_outlet_reads_the_name_before_the_marker() {
+        assert_eq!(
+            cited_outlet("“Qafqazinfo” APA-ya istinadən xəbər verir ki, hadisə olub"),
+            Some("apa".to_string())
+        );
+        assert_eq!(
+            cited_outlet("TASS-a istinadla məlumat yayılıb"),
+            Some("tass".to_string())
+        );
+    }
+
+    #[test]
+    fn cited_outlet_is_none_without_a_marker() {
+        assert_eq!(cited_outlet("Bakıda bu yollar bağlıdır"), None);
+        assert_eq!(cited_outlet("İstinadlar göstərilib"), None);
+    }
+
+    #[test]
+    fn cited_outlet_rejects_lowercase_prose_before_a_marker() {
+        // Found on real data: Russian function words were being read as outlet names, which
+        // turned an unattributed repeat into a citation crediting nobody in particular.
+        assert_eq!(
+            cited_outlet("как сообщает источник, погода испортится"),
+            None
+        );
+        assert_eq!(cited_outlet("тепла передает агентство"), None);
+        // The real name is capitalized, and still comes back.
+        assert_eq!(
+            cited_outlet("как сообщает Reuters о ситуации"),
+            Some("reuters".to_string())
+        );
+        // A capitalized sentence opener is still prose: only the name after the marker counts.
+        assert_eq!(
+            cited_outlet("Как сообщает Reuters о ситуации"),
+            Some("reuters".to_string())
+        );
+    }
+
     #[test]
     fn tokens_keeps_a_proper_noun_run_as_one_phrase_token() {
         let t = tokens("Milli Məclis iclas keçirdi");

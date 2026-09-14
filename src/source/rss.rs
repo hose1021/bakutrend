@@ -2,7 +2,7 @@
 
 use crate::error::ParseError;
 use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
-use crate::text::{collapse_ws, decode_entities};
+use crate::text::{cited_outlet, collapse_ws, decode_entities};
 
 /// Parse feed bytes. Items without a link, title or timestamp are skipped and counted.
 pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
@@ -37,6 +37,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
         outcome.items.push(ParsedItem {
             section: section_from_url(&url),
             cited: is_cited(description.as_deref().unwrap_or_default()),
+            cited_outlet: cited_outlet(description.as_deref().unwrap_or_default()),
             external_id: url.clone(),
             url,
             title,

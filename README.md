@@ -8,21 +8,31 @@ events by popularity in the last hour, the last day, or the last week. The one d
 `@apatv`, which began returning a preview-less stub with no post text; turn it back on in the
 config when it serves posts again.
 
-Popularity combines three inputs — two measures of reader interest, plus a decay for age:
+Popularity combines four inputs — two measures of reader interest, a decay for age, and how
+fast the story is spreading:
 
-- **Cross-outlet coverage** — how many independent outlets carry the story. Reposts that
-  credit another outlet weigh half, and one outlet publishing both a feed and a channel
-  still casts a single vote.
-- **Reader engagement** — Telegram view counts, normalized per channel so a large channel's
-  routine post does not outrank a small channel's breakout post.
-- **Freshness** — a story decays as it ages inside the selected window, so an old story does
-  not hold the top slot on coverage and views alone.
+- **Independent coverage** — how many outlets did the reporting. A repeat that names the
+  outlet it took the story from confirms nothing and adds only to spread; a repeat that
+  credits nobody keeps the older half weight, because nobody can prove which side of the
+  line it is on. One outlet publishing both a feed and a channel still casts a single vote.
+- **Reader engagement** — Telegram views per hour, divided by that channel's own typical
+  pace so a large channel's routine post does not outrank a small channel's breakout post.
+  An outlet is counted once, from its fastest post: five repeats of one story reach the same
+  readers five times over.
+- **Freshness** — decay from the last moment the story actually developed, which is the
+  newest item from an outlet that had not carried it yet. A channel reposting the same
+  headline every five minutes does not keep a dead story at the top.
+- **Spread velocity** — how many outlets first picked the story up in the last 20 minutes
+  (or 4 hours, in the day window; 24 hours, in the week window).
 
-The three combine as `0.40 × coverage + 0.40 × engagement + 0.20 × freshness` by default;
-the weights are configurable.
+The four combine as
+`0.35 × coverage + 0.35 × engagement + 0.20 × freshness + 0.10 × spread` by default; the
+weights are configurable. Coverage and engagement are scaled against the 95th percentile of
+the window rather than its maximum, so one outlier cannot flatten every other story's score.
 
-Press `Enter` on any story to see every outlet carrying it, each with its timestamp and
-view count, plus the coverage / engagement / freshness breakdown behind its score.
+Press `Enter` on any story to see every outlet carrying it, each with whether it is
+independent or a repeat, its timestamp, view count, views per hour and how far above its
+channel's normal pace it is — plus the raw and normalized breakdown behind the score.
 
 ## Install
 
@@ -111,13 +121,15 @@ header: TOML has no way back to the document root, so `local_keywords` written a
 
 ```toml
 poll_interval_secs = 300
-cluster_threshold  = 0.45
+cluster_threshold  = 0.40
+semantic_threshold = 0.80
 local_keywords     = ["Bakı", "Gəncə", "Qarabağ", "Azərbaycan"]
 
 [weights]
-coverage   = 0.40
-engagement = 0.40
-freshness  = 0.20
+coverage        = 0.35
+engagement      = 0.35
+freshness       = 0.20
+spread_velocity = 0.10
 
 [retention]
 view_sample_days = 30
@@ -130,8 +142,28 @@ outlet  = "Qafqazinfo"   # one outlet may own several sources
 enabled = true
 ```
 
+`cluster_threshold` is Jaccard similarity over headline words: two items merge at or above
+it, but only when they also share a named entity, so two sentences about different events in
+the same city stay apart. `semantic_threshold` is the cosine similarity at which an
+embedding provider may merge two headlines that share no word at all; it has no effect until
+vectors exist in the database (see *Semantic similarity* below).
+
 Articles are kept forever. The only thing retention prunes is Telegram view samples,
 after 30 days.
+
+## Semantic similarity (not wired up)
+
+`src/embed.rs` defines the `EmbeddingProvider` interface, the cosine and centroid helpers and
+a SQLite-backed vector cache, and `embed::embed_pending` is the job that fills that cache.
+The clustering rule that consumes it is live and tested: an item with a vector is compared
+against each group's centroid, and joins at `semantic_threshold`.
+
+**It does nothing in a default build, because no provider is implemented.** There is no HTTP
+client for an embedding API in this program and no API key handling; with no vectors in the
+`embeddings` table the clusterer decides purely lexically, which is exactly what the
+`cluster_threshold` rule describes. Adding a provider means implementing one trait method and
+calling `embed_pending` once per poll with a writer connection — see the module docs in
+`src/embed.rs`. Nothing else changes, and the app picks the vectors up automatically.
 
 ### Paths on macOS
 

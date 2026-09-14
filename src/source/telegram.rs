@@ -6,7 +6,7 @@
 use scraper::{Html, Selector};
 
 use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
-use crate::text::{collapse_ws, decode_entities};
+use crate::text::{cited_outlet, collapse_ws, decode_entities};
 
 /// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number, and groups
 /// thousands with a no-break space (`12 345`). A value that fails to parse would silently drop
@@ -96,6 +96,7 @@ pub fn parse(html: &str) -> ParseOutcome {
         // The syndication rule is not limited to article feeds: a channel reposting another
         // outlet's story is exactly the case it targets.
         let cited = is_cited(&body);
+        let credited = cited_outlet(&body);
         outcome.items.push(ParsedItem {
             external_id: post_id.to_string(),
             section: section_from_url(&url),
@@ -105,6 +106,7 @@ pub fn parse(html: &str) -> ParseOutcome {
             published_at,
             views,
             cited,
+            cited_outlet: credited,
             publisher: None,
         });
     }
