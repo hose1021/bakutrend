@@ -45,7 +45,8 @@ Existing news readers give a chronological firehose, not a ranked answer. Google
 - No non-interactive **ranking output** mode: no `--top`, no JSON on stdout. Ranking is a pure function, so a printer can be added later without rework. `--poll-only` (§12) is not an exception — it produces no ranking output, it only keeps history accumulating.
 - No category filtering UI, no notifications, no article full-text reading, no images.
 - No reading of article bodies. Only feed metadata, Telegram post text and view counts.
-- No mobile, web or server component.
+- No mobile or desktop app. `--serve` exposes the ranking as a read-only page and a JSON
+  endpoint: no accounts, no writes, no client-side state, and no script on the page.
 
 ---
 
@@ -66,7 +67,7 @@ Every entry below was fetched successfully during design research. All 20 source
 | Baku.ws | `https://baku.ws/rss` | 30 | 7 h | 20/80 | az |
 | Trend.az | `https://trend.az/rss/` | 25 | 19 h | 15/85 | en |
 | Minval | `https://minval.az/rss` | 23 | 10 h | 15/85 | ru |
-| Haqqin.az | `https://haqqin.az/rss/` | 20 | 6 h | 25/75 | ru |
+| Haqqin.az | `https://haqqin.az/rss.xml` | 20 | 6 h | 25/75 | ru |
 
 ### 5.2 Telegram channels (10)
 
@@ -139,7 +140,7 @@ src/
 ```
 
 Three modules beyond the first draft, each with one responsibility: `text.rs` (normalization
-is shared by clustering, citation detection and the local filter, so it cannot live inside
+is shared by clustering, citation detection and the text filter, so it cannot live inside
 any one of them), `poller.rs` (the poll cycle takes a `Fetcher`, so it can be driven offline
 by fixtures), and `source/http.rs` (the network boundary, separate from the parsing).
 
@@ -337,32 +338,42 @@ The story's displayed view count is the sum of each outlet's best post, for the 
 
 **Explainability.** The detail pane displays $C$, $E$, $F$ and the final score for the selected story. When a ranking looks wrong, the cause is visible rather than guessed at.
 
-### 10.1 Local filter
+### 10.1 Text filter
 
-A config-editable keyword list matched against normalized title and description: place names (Bakı, Gəncə, Sumqayıt, Mingəçevir, Bərdə, Lənkəran, Astara, Naxçıvan, Şuşa, Xankəndi, Qarabağ, Şərqi Zəngəzur, Xəzər, Abşeron …) and institutions (Azərbaycan, Prezident, Milli Məclis, XİN, Nazirlər Kabineti, DİN, SOCAR, AZAL, ADY, ANAMA …).
+Typed with `/`, matched against the folded story title. It narrows what is shown and never what is ranked: the ranking is computed over the whole window, so opening the filter cannot move a score. The same predicate runs before the quiet fallback takes its twelve stories, so a matching story outside the twelve newest still appears.
 
-Toggled with `l`, off by default. It is a **heuristic**: the default view is everything Azerbaijani media publishes, because world news carried by all ten outlets genuinely is what Baku is reading — that is an answer, not noise. The filter is one keypress away, and it is never applied silently.
+An earlier revision also shipped a **local keyword filter** — a config-editable list of place names and institutions, toggled with `l`. It was removed on 2026-09-14: a keyword list cannot decide what is Azerbaijani news. It let world news through whenever a local institution was mentioned in passing, and dropped local stories that used unfamiliar place names. Coverage and engagement decide what matters; `/` is one keypress away for a reader who wants to narrow the list by hand.
 
 ---
 
 ## 11. TUI
 
 ```
-┌ bakutrend ───────────────────────── 12/20 sources ok · polled 34s ago ┐
-│ [1h]  24h   7d   ·  [Local]  ·  / filter                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│ #   Δ     Score  Cvg  Eng  Fresh  Headline                      Outlets │
-│ 1   +3    0.91   7.0  1.8  0.72   Bakıda bu yollar bağlıdır         7   │
-│ 2   new   0.84   3.0  2.4  0.95   Gəncədə iki nəfər bıçaqlandı      3   │
-├─────────────────────── detail ──────────────────────────────────────────┤
-│ Bakıda bu yollar bağlıdır — Bakı Nəqliyyat Agentliyi məlumat yayıb…     │
-│ coverage 7.0   engagement 1.8   freshness 0.72   score 0.91             │
-│  qafqazinfo    20:31  2.65K views   qafqazinfo.az/news/detail/…         │
-│  apa.az        20:12  1.10K views   apa.az/incident/…                   │
-└─────────────────────────────────────────────────────────────────────────┘
+ bakutrend                                                                382 stories
+[ 1h ] [ 24h ] [ 7d ]                                 12/19 sources ok · polled 1m ago
+────────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────│ Sosial şəbəkədə "Çevik" ləqəbi ilə …
+  #  HEADLINE                           OUTLETS STATUS AGE    │ ⚖️ "Çevik" ləqəbli tiktoker Məqsəd
+▌ 01 Sosial şəbəkədə "Çevik" ləqəbi il… 3       NEW    11m    │ Bağırov və Kamran Bilalov barəsində
+  02 Sabahdan dövlət qurumlarında iş r… 4       +2     31m    │ SCORE
+  03 Nazir: Məktəblərdə 12 illik təhsi… 2       0      1h     │ 1.00  ██████████
+                                                              │ new since the previous 24h window
+                                                              │ SIGNALS
+                                                              │ Coverage   ██████ 1.00  3 outlets
+                                                              │ Engagement ██████ 1.00  519/h ×3.6
+                                                              │ Freshness  ██████ 0.98  11m ago
+                                                              │ Spread     ██████ 1.00  +3 in 4h
+                                                              │ SOURCES
+                                                              │ APA  independent  11m
+                                                              │   157 views · 380/h ×2.6
+[1-3] windows  [j/k] move  [Enter] open  [/] filter  [l] language  [r] poll   [?] help  [q] quit
 ```
 
-**Keys.** `1` / `2` / `3` or `Tab` switch windows; `j` / `k` or arrows move; `g` / `G` jump to top or bottom; `Enter` opens the article in the default browser (`open`); `l` toggles the local filter; `/` filters by text; `r` forces a poll; `?` shows help; `q` quits.
+Colour is meaning, not decoration: cyan for the score, the active tab and the marker in front of the selected row; green for `NEW`; yellow for the quiet-hour banner, which is the one state where the list does not match the tab's claim; red for a failure. Body text and secondary text are the terminal's own foreground and its dim variant, and the selected row is marked by a `▌` that does not depend on its background tint.
+
+The header's first row names the program and counts the stories; the second carries the window tabs and, on the right, the source health and the age of the last poll. The list ranks the stories; the card beside it explains the selected one. Above 92 columns the card sits beside the list with a rule between them; below that it drops under it and takes the lower 40% of the screen, so the list keeps most of the height. A status line above the footer carries any failure, on its own row, where a small terminal cannot cut it off.
+
+**Keys.** `1` / `2` / `3` or `Tab` switch windows; `j` / `k` or arrows move; `g` / `G` jump to top or bottom; `Enter` opens the article in the default browser (`open`); `l` cycles the interface language (English, Azerbaijani, Russian); `/` filters by text; `r` forces a poll; `?` shows help; `q` quits.
 
 **Default window on open:** 24 hours — the 1 h window is often thin and the 7 d window is initially backfilled.
 
@@ -379,21 +390,24 @@ discoverable rather than invisible.
 
 **Text.** Headlines render as published in Azerbaijani, Russian or English. Truncation uses `unicode-width`, never byte or `char` counts.
 
+**Language.** The interface — not the news — speaks English, Azerbaijani and Russian. `language` in the config file or `--lang` on the command line selects one; an unknown code is refused at startup with the field and the three values that work. `l` cycles the three without a restart, and the status line names the language just chosen in that language's own words. The switch lasts for the session: the config file is not rewritten. Each language carries its own strings and its own plurals, so Russian says `1 издание`, `2 издания` and `5 изданий` rather than one form for all three.
+
 ---
 
 ## 12. CLI and configuration
 
 ```
-bakutrend [--poll-only] [--config <path>] [--log [LEVEL]] [--reset-db]
+bakutrend [--poll-only] [--config <path>] [--lang <en|az|ru>] [--log [LEVEL]] [--reset-db]
 ```
 
 - `--poll-only` runs the poller without the TUI, so week-history accumulates while the TUI is closed. No launchd agent is installed; the README documents an example plist for the user to install if they want it.
 - `--log [LEVEL]` installs the opt-in file logger, matching `ttymap`'s convention: default off, output to a state-directory file, truncated on startup.
+- `--lang <en|az|ru>` sets the interface language and overrides the config file.
 - `--reset-db` deletes and rebuilds the database, requiring confirmation.
 
 **Locations** follow `ttymap`'s convention via the `directories` crate v6 with brand `bakutrend`. On macOS that yields `~/Library/Application Support/bakutrend` for config and data, and `~/Library/Caches/bakutrend` for cache. `state_dir()` is Linux-only and falls back to `data_local_dir()`.
 
-**Config** is TOML: source toggles (all 20, each with an `enabled` flag), poll interval, cluster threshold, score weights, local-filter keywords, retention window.
+**Config** is TOML: source toggles (all 20, each with an `enabled` flag), poll interval, cluster threshold, score weights, interface language, retention window.
 
 ---
 
@@ -465,7 +479,7 @@ Each earns its place: `feed-rs` handles the four real-world malformation traps i
 - **Telegram history is 14 h.** Only `@meydantv` reaches further (~92 h). The 1-week window for engagement therefore depends on a locally running poller; until it has run for a week, the 7 d window is coverage-weighted and partly backfilled.
 - **Views are biased by channel size.** Per-channel normalization mitigates this but does not eliminate it: it ranks relative buzz within a channel, not absolute reach across channels.
 - **Syndication detection is lexical.** Citation phrasing varies; the regex will miss some reposts and will not misattribute originators, because it never tries to identify them.
-- **The local filter is a keyword heuristic.** It will let some world news through when a local institution is mentioned in passing, and will drop some local news that uses unfamiliar place names.
+- **The local filter was removed (2026-09-14).** A keyword list cannot decide what is Azerbaijani news: it let world news through whenever a local institution was mentioned in passing, and dropped local stories that used unfamiliar place names. Coverage and engagement decide what matters now; `/` remains for a reader who wants to narrow the list by hand.
 - **Google News is used as a seed only,** one `when:7d` request on an empty database. Its terms permit personal feed-reader use; bakutrend does not depend on it for ongoing ranking.
 - **Clustering is lexical.** Two outlets describing the same event with no shared vocabulary stay separate stories. This is the accepted trade-off of not using embeddings; if live data shows it failing badly, embeddings slot in behind the same `assign` interface. The revision narrowed this further on purpose: a lexical match now needs a shared **name** or one headline nested inside the other, so two outlets covering the same Baku event in different words and naming nobody stay apart. The embedding route is the designed answer, and it is not wired up.
 - **Cited-outlet extraction is approximate.** The name credited by a citation is read lexically, and on live data it resolves about 60 % of cited items; the rest stay `repost` rather than becoming a `citation` that confirms nothing. Generic nouns survive as false origins (`агентство`, `национальная`), which would need a gazetteer of known outlets to reject — the parser cannot see the `outlets` table.

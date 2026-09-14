@@ -1,6 +1,6 @@
 //! Grouping items into stories. Lexical, deterministic, and deliberately free of models.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::store::ItemRow;
 use crate::text::{Entity, entities, tokens};
@@ -65,6 +65,14 @@ pub struct Group {
     pub newest: i64,
     pub oldest: i64,
     pub items: Vec<ItemRow>,
+    /// When each outlet first carried the story, over the group's whole history.
+    ///
+    /// Kept apart from `items` because a scoring window trims `items` to its own range, and a
+    /// trimmed item is not an arrival: an outlet that reported before the window and repeated
+    /// inside it has been carrying the story all along, and counting its repeat as a fresh
+    /// pickup would invent spread that did not happen. Built from every item the group has
+    /// ever absorbed, so trimming cannot change it.
+    pub outlet_first: BTreeMap<i64, i64>,
     /// Entities of the group's canonical item — the earliest one. Deliberately not the union
     /// of its members: a union grows with every arrival, and an item could then join through a
     /// chain of pairwise agreements that no two members of the group actually share.
@@ -89,6 +97,7 @@ impl Group {
             newest: item.published_at,
             oldest: item.published_at,
             items: vec![item.clone()],
+            outlet_first: BTreeMap::from([(item.outlet_id, item.published_at)]),
             entities,
             embedding_sum: Vec::new(),
         };
@@ -128,6 +137,10 @@ impl Group {
         self.newest = self.newest.max(item.published_at);
         self.oldest = self.oldest.min(item.published_at);
         self.items.push(item.clone());
+        self.outlet_first
+            .entry(item.outlet_id)
+            .and_modify(|first| *first = (*first).min(item.published_at))
+            .or_insert(item.published_at);
         self.absorb(embedding);
     }
 }
@@ -463,6 +476,65 @@ mod tests {
             groups.len(),
             2,
             "a shared place name must not merge two events"
+        );
+    }
+
+    /// The gazetteer aligns one place written two ways, which is what the entity gate needs. It
+    /// does not by itself join two languages: two headlines that share only a city stay apart,
+    /// in one language or two, because a shared place carries no event. This program has no
+    /// translation or semantic step, so a cross-language duplicate of one event is a known miss.
+    #[test]
+    fn the_gazetteer_aligns_names_across_languages_without_joining_their_words() {
+        assert_eq!(
+            entities("Bakıda yanğın olub")
+                .first()
+                .map(|e| e.text.clone()),
+            Some("baki".to_string())
+        );
+        assert_eq!(
+            entities("В Баку произошёл пожар")
+                .first()
+                .map(|e| e.text.clone()),
+            Some("baki".to_string()),
+            "one city, two spellings, one entity"
+        );
+
+        let clusterer = Clusterer::new(0.45);
+        let mut groups = Vec::new();
+        clusterer.assign(
+            &mut groups,
+            &item(1, 1, "Bakıda güclü yağış yolları bağladı", 100),
+        );
+        clusterer.assign(
+            &mut groups,
+            &item(2, 2, "В Баку сильный дождь закрыл дороги", 200),
+        );
+        assert_eq!(
+            groups.len(),
+            2,
+            "a shared name and no shared word is not one story"
+        );
+    }
+
+    /// The limit of a lexical rule, written down as a test so a change to it is deliberate: two
+    /// headlines about one event that share no word and name no place the gazetteer knows stay
+    /// apart. Only a semantic or translation step could join them, and this program has none.
+    #[test]
+    fn an_event_phrased_with_no_shared_name_stays_apart() {
+        let clusterer = Clusterer::new(0.45);
+        let mut groups = Vec::new();
+        clusterer.assign(
+            &mut groups,
+            &item(1, 1, "Yük maşını aşıb yükü yola səpildi", 100),
+        );
+        clusterer.assign(
+            &mut groups,
+            &item(2, 2, "Truck overturned and spilled its cargo", 200),
+        );
+        assert_eq!(
+            groups.len(),
+            2,
+            "no shared token and no known name leaves nothing to merge on"
         );
     }
 

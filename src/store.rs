@@ -105,6 +105,32 @@ impl Window {
     pub fn all() -> [Window; 3] {
         [Window::Hour, Window::Day, Window::Week]
     }
+
+    /// The next wider period, with the week as its own end: a wider window than the week is not
+    /// accumulated here, and pretending otherwise would show less history under a longer name.
+    pub fn wider(self) -> Self {
+        match self {
+            Window::Hour => Window::Day,
+            Window::Day | Window::Week => Window::Week,
+        }
+    }
+}
+
+/// One story's place in a stored ranking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotStory {
+    pub key: String,
+    pub rank: i64,
+    pub score: f64,
+}
+
+/// A ranking as it was computed at one moment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    /// When the ranking was calculated, not when it was read back.
+    pub computed_at: i64,
+    /// Stories in rank order, best first.
+    pub stories: Vec<SnapshotStory>,
 }
 
 pub struct Store {
@@ -166,6 +192,32 @@ CREATE TABLE IF NOT EXISTS embeddings (
   vector     BLOB NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (item_id, model)
+);
+
+-- Rankings as they were computed, so a later run can compare against something that really was
+-- shown. Recomputing a past ranking from today's rows leaks today's headlines, citations and
+-- view counts into a claim about yesterday: an article first seen this morning would change
+-- what the ranking "was" last night. `algorithm_version` keeps two different scoring rules
+-- apart, and `computed_at` is when the numbers were actually calculated.
+CREATE TABLE IF NOT EXISTS ranking_snapshots (
+  computed_at       INTEGER NOT NULL,
+  algorithm_version INTEGER NOT NULL,
+  window_hours      INTEGER NOT NULL,
+  story_key         TEXT NOT NULL,
+  rank              INTEGER NOT NULL,
+  score             REAL NOT NULL,
+  PRIMARY KEY (computed_at, window_hours, story_key)
+);
+CREATE INDEX IF NOT EXISTS ranking_snapshots_lookup
+  ON ranking_snapshots(window_hours, algorithm_version, computed_at);
+
+-- State that has to outlive the process, as opposed to state that can be recomputed from
+-- `items` and `view_samples`. A fresh table here reaches a database created by an earlier
+-- version too: `CREATE TABLE IF NOT EXISTS` is re-run on every open, unlike a column, which
+-- needs its own guarded `ALTER TABLE` in `migrate`.
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 "#;
 
@@ -362,6 +414,10 @@ impl Store {
     /// Items and the view samples belonging to those items, for a time range.
     /// Samples are selected by their item, not their own timestamp, so a sample taken
     /// outside the range still describes an item inside it.
+    ///
+    /// An item whose `published_at` falls inside the range but which the program only discovered
+    /// later is left out: the range is a claim about what was knowable at its end, and a story
+    /// the program had never seen cannot have been part of it.
     pub fn window_data(
         &self,
         from: i64,
@@ -375,6 +431,7 @@ impl Store {
              JOIN sources s ON s.id = i.source_id
              JOIN outlets o ON o.id = i.outlet_id
              WHERE i.published_at >= ?1 AND i.published_at <= ?2
+               AND i.first_seen <= ?2
                AND (?3 = 1 OR i.is_backfill = 0)
                AND s.enabled = 1
              ORDER BY i.published_at DESC",
@@ -438,9 +495,10 @@ impl Store {
              FROM view_samples v
              JOIN items i ON i.id = v.item_id
              JOIN sources s ON s.id = i.source_id
-             WHERE i.published_at >= ?1 AND i.published_at <= ?2
-               AND (?3 = 1 OR i.is_backfill = 0)
-               AND s.enabled = 1",
+            WHERE i.published_at >= ?1 AND i.published_at <= ?2
+              AND i.first_seen <= ?2
+              AND (?3 = 1 OR i.is_backfill = 0)
+              AND s.enabled = 1",
         )?;
         let samples = sample_stmt
             .query_map(rusqlite::params![from, to, allow_backfill as i64], |r| {
@@ -462,6 +520,29 @@ impl Store {
         now: i64,
     ) -> Result<(Vec<ItemRow>, Vec<Sample>), StoreError> {
         self.window_data(now - window.seconds(), now, window.allows_backfill())
+    }
+
+    /// A value written by an earlier run, keyed by a name the writer chose.
+    ///
+    /// `meta` exists for the few facts that cannot be derived from `items` and `view_samples` —
+    /// a one-shot job that already ran, for instance. Absent is the normal answer for a database
+    /// that predates the key, and callers must treat it as "not done yet" rather than an error.
+    pub fn meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Record a fact for later runs. `ON CONFLICT` makes a repeat idempotent, so a crashed run
+    /// that repeats its last step cannot end up with two values under one key.
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
     }
 
     /// The model of the most recently written vector, or `None` when the cache is empty.
@@ -601,6 +682,149 @@ impl Store {
             .conn
             .execute("DELETE FROM view_samples WHERE ts < ?1", [before])?)
     }
+
+    /// Record a ranking as it was just computed, with the version of the arithmetic behind it.
+    ///
+    /// `stories` is `(key, score)` in rank order; the index in that slice is the rank. A repeat
+    /// write for one `(computed_at, window)` replaces the earlier rows rather than failing, so a
+    /// caller that recomputes the same moment cannot end up with two ranks for one story.
+    pub fn save_snapshot(
+        &mut self,
+        computed_at: i64,
+        algorithm_version: i64,
+        window: Window,
+        stories: &[(String, f64)],
+    ) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM ranking_snapshots WHERE computed_at = ?1 AND window_hours = ?2",
+            rusqlite::params![computed_at, window.hours()],
+        )?;
+        for (rank, (key, score)) in stories.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO ranking_snapshots
+                   (computed_at, algorithm_version, window_hours, story_key, rank, score)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    computed_at,
+                    algorithm_version,
+                    window.hours(),
+                    key,
+                    rank as i64,
+                    score
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(stories.len())
+    }
+
+    /// The stored ranking of `window` closest to `at`, computed by `algorithm_version` and no
+    /// further away than `tolerance`.
+    ///
+    /// `None` means there is nothing comparable: a window that has never been ranked, a ranking
+    /// computed by different arithmetic, or one too far from the moment asked about. Every caller
+    /// must treat that as "no comparison", never as "nothing changed".
+    pub fn snapshot_near(
+        &self,
+        window: Window,
+        algorithm_version: i64,
+        at: i64,
+        tolerance: i64,
+    ) -> Result<Option<Snapshot>, StoreError> {
+        let computed_at: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT computed_at FROM ranking_snapshots
+                  WHERE window_hours = ?1 AND algorithm_version = ?2
+                    AND computed_at BETWEEN ?3 - ?4 AND ?3 + ?4
+                  ORDER BY ABS(computed_at - ?3) ASC, computed_at DESC
+                  LIMIT 1",
+                rusqlite::params![window.hours(), algorithm_version, at, tolerance.max(0)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(computed_at) = computed_at else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT story_key, rank, score FROM ranking_snapshots
+              WHERE computed_at = ?1 AND window_hours = ?2
+              ORDER BY rank ASC",
+        )?;
+        let stories = stmt
+            .query_map(rusqlite::params![computed_at, window.hours()], |r| {
+                Ok(SnapshotStory {
+                    key: r.get(0)?,
+                    rank: r.get(1)?,
+                    score: r.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Snapshot {
+            computed_at,
+            stories,
+        }))
+    }
+
+    /// The newest stored ranking time for a window, or `None` when it has never been ranked.
+    pub fn latest_snapshot_at(&self, window: Window) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(computed_at) FROM ranking_snapshots WHERE window_hours = ?1",
+            [window.hours()],
+            |r| r.get::<_, Option<i64>>(0),
+        )?)
+    }
+
+    /// The fullest text stored for each of `urls`, keyed by URL.
+    ///
+    /// A ranked story carries a lede — the newest body cut at three hundred characters — because
+    /// a list row has room for nothing longer. The store kept what the sources published, and
+    /// the details view is where the whole of it belongs.
+    ///
+    /// One article can arrive more than once, through Google News and through the outlet's own
+    /// feed, and both rows hold the same URL. The longest text wins: one column holds a summary
+    /// and a full body alike, and of the two the longer one is the article.
+    pub fn bodies_by_url(&self, urls: &[String]) -> Result<HashMap<String, String>, StoreError> {
+        let mut bodies: HashMap<String, String> = HashMap::new();
+        if urls.is_empty() {
+            return Ok(bodies);
+        }
+        // The placeholder list is built here because SQLite takes one parameter per URL and the
+        // count is only known at run time.
+        let placeholders = std::iter::repeat_n("?", urls.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT url, description FROM items
+              WHERE url IN ({placeholders}) AND description IS NOT NULL"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(urls.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (url, body) = row?;
+            // A feed that ships an empty summary is not a source with text. Returning it would
+            // hand the details view a blank block and hide the note that says why.
+            if body.trim().is_empty() {
+                continue;
+            }
+            let longer = bodies.get(&url).is_none_or(|kept| body.len() > kept.len());
+            if longer {
+                bodies.insert(url, body);
+            }
+        }
+        Ok(bodies)
+    }
+
+    /// Drop stored rankings older than `before`. They are history the movement column no longer
+    /// reaches; keeping them forever would grow the database without ever being read.
+    pub fn prune_snapshots(&mut self, before: i64) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "DELETE FROM ranking_snapshots WHERE computed_at < ?1",
+            [before],
+        )?)
+    }
 }
 
 /// Single outlet lookup, shared by `resolve_outlet` and the upsert transaction
@@ -730,6 +954,42 @@ mod tests {
             .unwrap();
         assert_eq!(first_seen, 1_700_000_000);
         assert_eq!(last_seen, 1_700_000_900);
+    }
+
+    /// The details view reads whole texts, and a ranked story holds only a lede. The same URL can
+    /// arrive through two sources, and one column holds both a summary and a full body: the
+    /// longer text is the article, and it is the one the reader is owed.
+    #[test]
+    fn stored_bodies_come_back_whole_and_the_longest_wins() {
+        let (mut store, source_id) = fixture();
+        let mut short = item("a", "Başlıq", 1_700_000_000);
+        short.description = Some("Qısa xülasə.".into());
+        let mut long = item("b", "Başlıq", 1_700_000_000);
+        long.url = short.url.clone();
+        long.description = Some("Tam mətn. ".repeat(80));
+        let mut none = item("c", "Başlıqsız mətn", 1_700_000_000);
+        none.description = None;
+        // A feed that ships an empty summary is not a source with text either.
+        let mut blank = item("d", "Boş mətn", 1_700_000_000);
+        blank.description = Some("   \n".into());
+        store
+            .upsert_items(source_id, &[short, long, none, blank], 1_700_000_000)
+            .unwrap();
+
+        let urls = vec![
+            "https://example.az/a".to_string(),
+            "https://example.az/c".to_string(),
+            "https://example.az/d".to_string(),
+            "https://example.az/missing".to_string(),
+        ];
+        let bodies = store.bodies_by_url(&urls).unwrap();
+        assert_eq!(bodies.len(), 1, "only the URLs with text are returned");
+        let body = &bodies["https://example.az/a"];
+        assert!(body.starts_with("Tam mətn."), "{body}");
+        assert_eq!(body.chars().count(), 800, "the whole stored text, uncut");
+        assert!(!bodies.contains_key("https://example.az/c"));
+        assert!(!bodies.contains_key("https://example.az/d"));
+        assert!(store.bodies_by_url(&[]).unwrap().is_empty());
     }
 
     #[test]
@@ -933,6 +1193,12 @@ mod tests {
     fn outlet_key_folds_and_strips_punctuation() {
         assert_eq!(outlet_key("Report.az"), outlet_key("report"));
         assert_eq!(outlet_key("APA"), outlet_key("apa"));
+        // The same outlet written with its site prefix and with none: coverage counts outlets,
+        // so two spellings of one outlet would count as two independent reporters.
+        assert_eq!(outlet_key("www.report.az"), outlet_key("Report"));
+        assert_eq!(outlet_key("Baku.ws"), outlet_key("baku"));
+        // Different outlets stay different: a prefix fallback would merge these two.
+        assert_ne!(outlet_key("Baku Post"), outlet_key("Baku.ws"));
     }
 
     #[test]
@@ -1192,5 +1458,45 @@ mod tests {
         // Opening again must not try to add the column twice.
         let again = Store::open(&path).unwrap();
         assert_eq!(again.window_data(0, 1_000, true).unwrap().0.len(), 1);
+    }
+
+    /// The same for a table rather than a column: `meta` arrives on an existing database when it
+    /// is next opened, and the rows already there are untouched.
+    #[test]
+    fn a_database_from_before_the_meta_table_gains_it_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let mut store = Store::open(&path).unwrap();
+            let source_id = store
+                .ensure_source(&spec("APA", "APA RSS", "https://apa.az/rss"), true)
+                .unwrap();
+            store
+                .upsert_items(
+                    source_id,
+                    &[item("a", "Bakıda yollar bağlıdır", 1_000)],
+                    1_000,
+                )
+                .unwrap();
+            // A database from a version that had no `meta` table at all.
+            store.conn.execute("DROP TABLE meta", []).unwrap();
+            assert!(store.meta("anything").is_err(), "the table is gone");
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.meta("anything").unwrap(),
+            None,
+            "opening recreates the table, and an unrecorded key is absent rather than an error"
+        );
+        store.set_meta("anything", "1").unwrap();
+        assert_eq!(store.meta("anything").unwrap().as_deref(), Some("1"));
+        store.set_meta("anything", "2").unwrap();
+        assert_eq!(
+            store.meta("anything").unwrap().as_deref(),
+            Some("2"),
+            "a repeat writes one value, not two"
+        );
+        assert_eq!(store.item_count().unwrap(), 1, "the rows survived");
     }
 }

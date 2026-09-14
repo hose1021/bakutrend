@@ -56,4 +56,12 @@ pub enum ConfigError {
     },
     #[error("source `{name}` has unknown kind `{kind}`")]
     UnknownSourceKind { name: String, kind: String },
+    /// A number that parsed but cannot mean anything. The message names the field and the
+    /// range, because the value alone does not tell the reader what would have been accepted.
+    #[error("config `{field}` is {value}, expected {expected}")]
+    InvalidValue {
+        field: String,
+        value: String,
+        expected: String,
+    },
 }
