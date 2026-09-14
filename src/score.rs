@@ -1,9 +1,9 @@
 //! Popularity scoring: cross-outlet coverage, reader engagement, and freshness.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cluster::Group;
 use crate::source::SourceKind;
@@ -43,22 +43,59 @@ const MIN_BASELINE: f64 = 1.0;
 /// widely a story is being read.
 const MAX_RELATIVE_VELOCITY: f64 = 10.0;
 
+/// Identifies the scoring arithmetic behind a stored ranking. Two rankings computed by
+/// different versions are not comparable, and a movement claim between them would be invented
+/// rather than measured. Bump this whenever a change here alters any story's score or order.
+pub const ALGORITHM_VERSION: i64 = 2;
+
+/// The recent interval an item's current pace is measured over.
+///
+/// A rate averaged over the item's whole life answers "how did this do overall", not "what is
+/// happening now", and the two diverge exactly when the news is over: a post that gained ten
+/// thousand views in its first hour and nothing since still shows five thousand views an hour
+/// against a two-hour average. Only samples inside this interval describe the current pace.
+const VELOCITY_RECENT_SECS: i64 = 3600;
+
+/// How old the newest sample may be before the number stops describing current pace.
+///
+/// The poller samples each item at most once per ten minutes, so half an hour without a sample
+/// means the source stopped answering for this item — a count that has not moved since is
+/// history, not a measurement, and showing it as current would present a stale number as news.
+const VELOCITY_STALE_AFTER_SECS: i64 = 1800;
+
+/// Two samples closer than this cannot show a slope. Telegram counts move in steps and the
+/// poller samples an item at most once per ten minutes, so a shorter span is step noise.
+const MIN_MEASURED_SPAN_SECS: i64 = 600;
+
+/// Floor on the age a single-sample estimate is divided by: a post published a minute ago has
+/// had no time to accumulate, and dividing by a fraction of an hour would report a spike.
+const MIN_AGE_HOURS: f64 = 0.25;
+
 /// Below this many stories, a 95th percentile is just the maximum wearing a hat, so the
 /// maximum is used directly and the intent is at least honest.
-const MIN_STORIES_FOR_P95: usize = 5;
+///
+/// The number is not a taste: nearest-rank `P95` is `ceil(0.95n)`-th of `n`, which for `n < 20`
+/// is the largest value itself. Twenty stories is where the percentile first drops one rank
+/// below the maximum, so below twenty there is nothing to choose between them.
+const MIN_STORIES_FOR_P95: usize = 20;
 
 /// What an item is, relative to the outlet that did the reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The three variants describe what the text says, and nothing more. None of them is a verdict
+/// on the journalism: this program reads a small marker table, and "no citation found" means
+/// exactly that — the item is credited with the full coverage weight because nothing in it
+/// contradicts that, not because it was proved to be original reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Provenance {
-    /// The outlet's own reporting, or a repeat that credits nobody knowable. Only this
-    /// counts as independent confirmation that a story matters.
+    /// No citation marker was found, or the marker names nobody knowable. The item carries the
+    /// full coverage weight, for want of anything that says otherwise.
     Independent,
-    /// A repeat that names the outlet it took the story from. It is demonstrably someone
-    /// else's work, so it confirms nothing.
+    /// A repeat that names the outlet it took the story from. It says someone else did the
+    /// reporting, which is the one direction the markers do support.
     Citation,
-    /// A repeat that credits nobody. It is not independent — someone had to report it first —
-    /// but nobody can prove which side of that line it is on, so it keeps the half weight
-    /// this project used before provenance was split.
+    /// A repeat that credits nobody. It is not the outlet's own work — someone had to report it
+    /// first — but nobody can prove which side of that line it is on, so it keeps the half
+    /// weight this project used before provenance was split.
     Repost,
 }
 
@@ -132,11 +169,16 @@ impl Baselines {
         }
     }
 
-    /// Median velocity per channel, over every rated Telegram item in `items`.
+    /// Median measured velocity per channel, over every rated Telegram item in `items`.
     ///
     /// `items` should be wider than one scoring window: a channel's typical pace is a property
     /// of the channel, not of the hour being ranked, and a one-hour sample would fall back to
     /// the global median almost always.
+    ///
+    /// Only observed slopes take part. A baseline is the divisor of a measured pace, and a
+    /// divisor built from single-sample estimates would mix an average since publication into a
+    /// comparison of current paces; an item that was never measured therefore contributes
+    /// nothing rather than an estimate.
     pub fn from_items(items: &[ItemRow], samples: &[Sample], now: i64) -> Self {
         let by_item = sample_index(samples);
         let mut per_channel: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
@@ -147,13 +189,16 @@ impl Baselines {
             if item.views.is_none() {
                 continue;
             }
-            let Some(rate) = by_item
+            let Some(velocity) = by_item
                 .get(&item.item_id)
-                .and_then(|owned| rate_of(owned, item.published_at, now))
+                .and_then(|owned| measured_velocity(owned, item.published_at, now))
             else {
                 continue;
             };
-            per_channel.entry(item.source_id).or_default().push(rate);
+            per_channel
+                .entry(item.source_id)
+                .or_default()
+                .push(velocity.per_hour);
         }
 
         let mut all: Vec<f64> = per_channel.values().flatten().copied().collect();
@@ -191,7 +236,7 @@ impl Baselines {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OutletContribution {
     pub outlet: String,
     /// Coverage weight of this outlet: the best provenance any of its items reached.
@@ -199,26 +244,39 @@ pub struct OutletContribution {
     pub provenance: Provenance,
     pub newest: i64,
     pub views: Option<i64>,
-    /// Raw fastest post of this outlet: views per hour as observed.
-    pub views_per_hour: Option<f64>,
-    /// That same post expressed as a multiple of its channel's typical velocity, capped.
+    /// Best post of this outlet by relative pace, and how that pace was obtained. `None` when
+    /// none of its posts carries a view sample.
+    pub velocity: Option<Velocity>,
+    /// `velocity` as a multiple of its channel's measured pace, capped. Present only for a
+    /// measured post: dividing an estimate by a measured median would compare two different
+    /// kinds of number.
     pub relative_velocity: Option<f64>,
     pub title: String,
     pub url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScoredStory {
     pub key: String,
     pub title: String,
+    /// A short body for the story, when any of its items carried one: the lede a reader can
+    /// use to decide whether the headline is worth opening.
+    pub description: Option<String>,
     pub score: f64,
-    /// Independent origins only. Repeats count toward [`Self::spread`], not here.
+    /// Outlets with no citation found, and their repeat weight. Repeats count toward
+    /// [`Self::spread`], not here.
     pub coverage: f64,
     pub coverage_norm: f64,
     pub engagement: f64,
     pub engagement_norm: f64,
     pub freshness: f64,
-    /// Every outlet carrying the story, independent or not.
+    /// Best measurement state behind [`Self::engagement`]: measured when any outlet's
+    /// contribution was an observed slope, otherwise estimated, stale, or absent.
+    pub engagement_basis: Option<VelocityBasis>,
+    /// Timestamp of the newest sample behind that contribution, so the screen can show how old
+    /// the measurement is instead of implying it is from this second.
+    pub engagement_observed_at: Option<i64>,
+    /// Every outlet carrying the story, cited or not.
     pub spread: usize,
     /// Outlets that picked the story up inside the recent sub-window.
     pub spread_velocity: f64,
@@ -231,41 +289,121 @@ pub struct ScoredStory {
     pub outlets: Vec<OutletContribution>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ItemRate {
-    pub item_id: i64,
-    pub source_id: i64,
-    pub rate: f64,
-    pub views: i64,
+/// How a views-per-hour number was obtained, so nothing on screen can present an estimate as a
+/// measurement, stale history as current pace, or absent data as a zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum VelocityBasis {
+    /// Two or more samples inside the recent interval, at least ten minutes apart: an observed
+    /// slope, and the only kind of number the score is built from.
+    Measured,
+    /// One fresh sample, or several too close together: total views spread over the item's age.
+    /// An estimate of the average pace since publication, not an observation of it.
+    Estimated,
+    /// The newest sample is older than the staleness bound. What was last seen, and no claim
+    /// about now.
+    Stale,
 }
 
-/// Views gained per hour for one item's samples, which must already be sorted by `ts`. With two
-/// samples at least ten minutes apart this is the observed slope; otherwise it spreads the total
-/// over the item's age, floored at a quarter hour. Both paths return views per hour, so callers
-/// can add rates from different items together.
-fn rate_of(owned: &[&Sample], published_at: i64, now: i64) -> Option<f64> {
-    let first = owned.first()?;
-    let last = owned.last()?;
-    if owned.len() >= 2 && last.ts - first.ts >= 600 {
-        let hours = (last.ts - first.ts) as f64 / 3600.0;
-        return Some(((last.views - first.views).max(0) as f64) / hours);
+/// A views-per-hour number with the evidence behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Velocity {
+    pub per_hour: f64,
+    pub basis: VelocityBasis,
+    /// Span between the samples behind a measured slope, in seconds. Zero when nothing was
+    /// measured.
+    pub observed_seconds: i64,
+    /// Timestamp of the newest sample the number rests on: its age is the age of the
+    /// measurement.
+    pub observed_at: i64,
+}
+
+impl Velocity {
+    /// True for the one basis the score may use: an observed slope.
+    pub fn is_measured(self) -> bool {
+        self.basis == VelocityBasis::Measured
     }
-    let age_hours = ((now - published_at).max(0) as f64 / 3600.0).max(0.25);
-    Some(last.views as f64 / age_hours)
 }
 
-/// Views gained per hour for one item, scanned out of a raw sample slice. `rank` goes through
-/// [`sample_index`] instead, which sorts each item's samples once rather than once per call;
-/// both routes end in [`rate_of`], so they cannot disagree.
-pub fn views_per_hour(
+/// Views per hour from one item's samples, which must already be sorted by `ts`.
+///
+/// `recent` bounds which samples may take part: only those at or after `now - recent`. Within
+/// that interval two samples at least [`MIN_MEASURED_SPAN_SECS`] apart give the observed slope;
+/// anything else gives the item's lifetime average as an estimate. `None` when the interval
+/// holds no sample at all, which is not a zero rate — it is no observation.
+fn velocity_of(owned: &[&Sample], published_at: i64, now: i64, recent: i64) -> Option<Velocity> {
+    let cutoff = now.saturating_sub(recent);
+    // `owned` is sorted by `ts`, so the samples inside the interval are a contiguous tail and
+    // the first and last of them are the ends of the slope.
+    let start = owned.partition_point(|sample| sample.ts < cutoff);
+    let window = &owned[start..];
+    let first = window.first()?;
+    let newest = window.last()?;
+
+    if window.len() >= 2 && newest.ts - first.ts >= MIN_MEASURED_SPAN_SECS {
+        let hours = (newest.ts - first.ts) as f64 / 3600.0;
+        let gained = newest.views.saturating_sub(first.views).max(0) as f64;
+        let per_hour = gained / hours;
+        if per_hour.is_finite() {
+            return Some(Velocity {
+                per_hour,
+                basis: VelocityBasis::Measured,
+                observed_seconds: newest.ts - first.ts,
+                observed_at: newest.ts,
+            });
+        }
+    }
+
+    let age_hours = ((now - published_at).max(0) as f64 / 3600.0).max(MIN_AGE_HOURS);
+    let per_hour = newest.views as f64 / age_hours;
+    if !per_hour.is_finite() {
+        return None;
+    }
+    Some(Velocity {
+        per_hour,
+        basis: VelocityBasis::Estimated,
+        observed_seconds: 0,
+        observed_at: newest.ts,
+    })
+}
+
+/// The item's current pace, or the last one observed when the samples stopped.
+///
+/// An item whose newest sample is older than [`VELOCITY_STALE_AFTER_SECS`], or which has none
+/// inside the recent interval, returns a [`VelocityBasis::Stale`] number: the caller can show
+/// it as history but must not score it as today's engagement.
+pub fn current_velocity(
     samples: &[Sample],
     item_id: i64,
     published_at: i64,
     now: i64,
-) -> Option<f64> {
+) -> Option<Velocity> {
     let mut owned: Vec<&Sample> = samples.iter().filter(|s| s.item_id == item_id).collect();
     owned.sort_by_key(|s| s.ts);
-    rate_of(&owned, published_at, now)
+    current_velocity_of(&owned, published_at, now)
+}
+
+/// [`current_velocity`] over samples the caller has already indexed and sorted.
+fn current_velocity_of(owned: &[&Sample], published_at: i64, now: i64) -> Option<Velocity> {
+    let last = owned.last()?;
+    let recent = velocity_of(owned, published_at, now, VELOCITY_RECENT_SECS);
+    match recent {
+        Some(velocity) if now - velocity.observed_at <= VELOCITY_STALE_AFTER_SECS => Some(velocity),
+        // Samples exist but none is fresh enough to describe now. The number is still worth
+        // showing as a last measurement, and is explicitly not a current pace.
+        _ => {
+            let mut stale = velocity_of(owned, published_at, now, i64::MAX)?;
+            stale.basis = VelocityBasis::Stale;
+            stale.observed_at = last.ts;
+            Some(stale)
+        }
+    }
+}
+
+/// An item's whole-history pace, ignoring staleness. Used for channel baselines, which describe
+/// how a channel behaved while it could be observed rather than how it behaves this minute.
+fn measured_velocity(owned: &[&Sample], published_at: i64, now: i64) -> Option<Velocity> {
+    let velocity = velocity_of(owned, published_at, now, i64::MAX)?;
+    velocity.is_measured().then_some(velocity)
 }
 
 /// Every item's samples, grouped by item and sorted by `ts`, built once per `rank` call. A
@@ -338,24 +476,25 @@ pub fn normalize(value: f64, scale: f64) -> f64 {
     (value / scale).clamp(0.0, 1.0)
 }
 
-/// The last moment the story actually developed: the newest item from an outlet that had not
-/// carried it yet.
+/// The last moment the story actually developed: the newest first arrival of an outlet that had
+/// not carried it yet.
 ///
 /// Freshness is measured from here, not from the newest item. A channel that reposts the same
 /// headline every five minutes would otherwise hold its story at the top forever, which is
 /// exactly backwards — nothing new happened. A story that is genuinely developing gains
 /// outlets, and those do move this forward.
+///
+/// Taken from [`Group::outlet_first`], which covers the group's whole history. A scoring window
+/// trims `items` to its own range, and reading freshness off the trimmed list would date the
+/// story to the oldest report *inside* the window: a story that has been running for hours
+/// would look brand new the moment the hour rolled over.
 fn updated_at(group: &Group) -> i64 {
-    let mut ordered: Vec<&ItemRow> = group.items.iter().collect();
-    ordered.sort_by_key(|item| (item.published_at, item.item_id));
-    let mut seen: HashSet<i64> = HashSet::new();
-    let mut updated = group.oldest;
-    for item in ordered {
-        if seen.insert(item.outlet_id) {
-            updated = updated.max(item.published_at);
-        }
-    }
-    updated
+    group
+        .outlet_first
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(group.oldest)
 }
 
 /// How many outlets first picked the story up inside the recent sub-window.
@@ -363,18 +502,87 @@ fn updated_at(group: &Group) -> i64 {
 /// First arrivals, not posts: an outlet that has been carrying the story for hours is not the
 /// story spreading, it is the story sitting still. Each outlet counts once however often it
 /// repeats, for the same reason coverage does.
+///
+/// Also read from the whole history, so a repost by an outlet that reported before the window
+/// is not mistaken for a fresh pickup.
 fn spread_velocity(group: &Group, now: i64, span: i64) -> f64 {
-    let cutoff = now - span;
-    let mut first: HashMap<i64, i64> = HashMap::new();
-    for item in &group.items {
-        first
-            .entry(item.outlet_id)
-            .and_modify(|ts| *ts = (*ts).min(item.published_at))
-            .or_insert(item.published_at);
-    }
-    first.values().filter(|ts| **ts >= cutoff).count() as f64
+    let cutoff = now.saturating_sub(span);
+    group
+        .outlet_first
+        .values()
+        .filter(|first| **first >= cutoff)
+        .count() as f64
 }
 
+/// Order of measurement kinds, for choosing which post speaks for an outlet. A measured slope
+/// outranks an estimate, and an estimate outranks history: the score counts measured paces, so
+/// the post that represents the outlet must be one of them whenever one exists.
+fn pace_kind(basis: VelocityBasis) -> u8 {
+    match basis {
+        VelocityBasis::Measured => 2,
+        VelocityBasis::Estimated => 1,
+        VelocityBasis::Stale => 0,
+    }
+}
+
+/// Whether a candidate post should replace the one currently representing an outlet.
+fn pace_better(
+    candidate: Velocity,
+    candidate_relative: Option<f64>,
+    previous: Velocity,
+    previous_relative: Option<f64>,
+) -> bool {
+    let key = |velocity: Velocity, relative: Option<f64>| {
+        (
+            pace_kind(velocity.basis),
+            relative.unwrap_or(velocity.per_hour),
+        )
+    };
+    key(candidate, candidate_relative) > key(previous, previous_relative)
+}
+
+/// How much of a story's body travels into the ranked list. Long enough for a lede, short
+/// enough that a Telegram post's full text is not copied into every story on every refresh.
+const DESCRIPTION_CHARS: usize = 280;
+
+/// The freshest body any item of the story carried. A feed that ships no summary must not blank
+/// out the description a channel's post of the same story does carry, so the newest item that
+/// has one wins.
+fn short_description(group: &Group) -> Option<String> {
+    group
+        .items
+        .iter()
+        .filter(|item| {
+            item.description
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+        })
+        .max_by_key(|item| item.published_at)
+        .and_then(|item| item.description.as_deref())
+        .map(clip_chars)
+}
+
+/// Truncate on a character boundary, so a headline that runs into the cap cannot split a
+/// multi-byte character and panic.
+fn clip_chars(text: &str) -> String {
+    match text.char_indices().nth(DESCRIPTION_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// Score stories and return them best first.
+///
+/// `groups` are the window's stories — what happened inside the period being ranked. Their
+/// items carry the window's own coverage and view counts. Freshness and spread are read from
+/// each group's whole history instead (`Group::outlet_first`), so trimming an item out of the
+/// window cannot turn a repeat into a fresh pickup. Callers that hold the same grouping over a
+/// wider range must therefore pass the *same* group objects, trimmed by [`Group::items`] only.
+///
+/// The result is an index of prominence by the sources this program can see: how many outlets
+/// reported the story, how fast its Telegram posts moved relative to their channels, how
+/// recently it developed, and how many outlets picked it up inside the recent sub-window. It is
+/// not a count of readers and not a probability that anyone read anything.
 pub fn rank(
     groups: &[Group],
     samples: &[Sample],
@@ -403,7 +611,7 @@ pub fn rank(
                     provenance,
                     newest: item.published_at,
                     views: None,
-                    views_per_hour: None,
+                    velocity: None,
                     relative_velocity: None,
                     title: item.title.clone(),
                     url: item.url.clone(),
@@ -424,18 +632,25 @@ pub fn rank(
                 // The outlet's view count is its best post, not the sum of its posts: five
                 // reposts of one story reach the same readers five times over.
                 entry.views = Some(entry.views.unwrap_or(0).max(views));
-                if let Some(rate) = by_item
+                if let Some(velocity) = by_item
                     .get(&item.item_id)
-                    .and_then(|owned| rate_of(owned, item.published_at, now))
+                    .and_then(|owned| current_velocity_of(owned, item.published_at, now))
                 {
-                    let relative = (rate / baselines.of(item.source_id)).min(MAX_RELATIVE_VELOCITY);
-                    // One number per outlet, from its fastest post. Grouping by channel first
-                    // and taking the maximum there is the same number: a maximum of maximums
-                    // is the maximum, and the channel only ever enters through the baseline
-                    // its own posts are divided by.
-                    if entry.views_per_hour.is_none_or(|top| rate > top) {
-                        entry.views_per_hour = Some(rate);
-                        entry.relative_velocity = Some(relative);
+                    // One number per outlet, chosen by relative pace rather than by raw views
+                    // per hour. An outlet may own several channels and they are not the same
+                    // size: a post at 1x on a big channel and a post at 10x on a small one are
+                    // the same raw number to nobody, and the baseline is the only thing that
+                    // makes the two comparable. The count is still the outlet's best post, so
+                    // the outlet enters the score once.
+                    let relative = velocity.is_measured().then(|| {
+                        (velocity.per_hour / baselines.of(item.source_id))
+                            .min(MAX_RELATIVE_VELOCITY)
+                    });
+                    if entry.velocity.is_none_or(|previous| {
+                        pace_better(velocity, relative, previous, entry.relative_velocity)
+                    }) {
+                        entry.velocity = Some(velocity);
+                        entry.relative_velocity = relative;
                     }
                 }
             }
@@ -444,12 +659,23 @@ pub fn rank(
         let mut coverage = 0.0;
         let mut engagement = 0.0;
         let mut view_count = 0i64;
+        let mut basis: Option<VelocityBasis> = None;
+        let mut observed_at: Option<i64> = None;
         let mut outlets: Vec<OutletContribution> = Vec::with_capacity(per_outlet.len());
         for (_, mut contribution) in per_outlet {
             contribution.weight = contribution.provenance.coverage_weight();
             coverage += contribution.weight;
+            // Only observed slopes enter the sum, and only through their ratio to the channel's
+            // measured pace: an estimate divided by a measured median is not a comparable
+            // number, and a stale count describes a story that has stopped moving.
             engagement += contribution.relative_velocity.unwrap_or(0.0);
-            view_count += contribution.views.unwrap_or(0);
+            view_count = view_count.saturating_add(contribution.views.unwrap_or(0));
+            if let Some(velocity) = contribution.velocity
+                && basis.is_none_or(|current| pace_kind(velocity.basis) > pace_kind(current))
+            {
+                basis = Some(velocity.basis);
+                observed_at = Some(velocity.observed_at);
+            }
             outlets.push(contribution);
         }
 
@@ -459,12 +685,15 @@ pub fn rank(
         stories.push(ScoredStory {
             key: group.key.clone(),
             title: group.title.clone(),
+            description: short_description(group),
             score: 0.0,
             coverage,
             coverage_norm: 0.0,
             engagement,
             engagement_norm: 0.0,
             freshness,
+            engagement_basis: basis,
+            engagement_observed_at: observed_at,
             spread: outlets.len(),
             spread_velocity: spread_velocity(group, now, spread_span),
             spread_velocity_norm: 0.0,
@@ -575,6 +804,65 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// A story's description is the freshest body any of its items carried: a feed that ships
+    /// no summary must not blank out the one a channel's post of the same story does carry.
+    #[test]
+    fn the_description_comes_from_the_newest_item_that_has_one() {
+        let mut group = story(&[
+            (1, 10, "Bakıda yollar bağlıdır", 3, None, false),
+            (2, 20, "Bakıda yollar bağlıdır", 1, None, false),
+        ]);
+        group.items[0].description = Some("Köhnə təsvir".into());
+        group.items[1].description = None;
+        let ranked = rank(
+            &[group.clone()],
+            &[],
+            &Baselines::empty(),
+            Window::Day,
+            &Weights::default(),
+            NOW,
+        );
+        assert_eq!(
+            ranked[0].description.as_deref(),
+            Some("Köhnə təsvir"),
+            "the only body in the story is used, however old its item is"
+        );
+
+        group.items[1].description = Some("Yeni təsvir".into());
+        let ranked = rank(
+            &[group],
+            &[],
+            &Baselines::empty(),
+            Window::Day,
+            &Weights::default(),
+            NOW,
+        );
+        assert_eq!(ranked[0].description.as_deref(), Some("Yeni təsvir"));
+    }
+
+    /// A Telegram post can be thousands of characters. The ranked story carries a lede, not the
+    /// whole post, and the cut lands on a character boundary so a multi-byte glyph cannot split.
+    #[test]
+    fn a_very_long_body_is_cut_short_on_a_character_boundary() {
+        let mut group = story(&[(1, 10, "Uzun xəbər budur", 1, None, false)]);
+        group.items[0].description = Some("ə".repeat(600));
+        let ranked = rank(
+            &[group],
+            &[],
+            &Baselines::empty(),
+            Window::Day,
+            &Weights::default(),
+            NOW,
+        );
+        let description = ranked[0].description.as_deref().unwrap();
+        assert_eq!(
+            description.chars().count(),
+            281,
+            "280 characters and the ellipsis"
+        );
+        assert!(description.ends_with('…'));
     }
 
     #[test]
@@ -720,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn views_per_hour_uses_the_sample_slope_then_falls_back_to_age() {
+    fn a_measured_slope_is_told_apart_from_a_lifetime_estimate() {
         let samples = vec![
             Sample {
                 item_id: 1,
@@ -733,17 +1021,22 @@ mod tests {
                 views: 700,
             },
         ];
-        let rate = views_per_hour(&samples, 1, NOW - 7200, NOW).unwrap();
-        assert!((rate - 600.0).abs() < 1e-6);
+        let velocity = current_velocity(&samples, 1, NOW - 7200, NOW).unwrap();
+        assert!((velocity.per_hour - 600.0).abs() < 1e-6);
+        assert_eq!(velocity.basis, VelocityBasis::Measured);
+        assert_eq!(velocity.observed_seconds, 3600);
+        assert_eq!(velocity.observed_at, NOW);
 
-        // A single sample two hours old: 400 views spread over two hours.
+        // A single sample two hours old: 400 views spread over two hours. The number is an
+        // estimate of the lifetime average, and it says so.
         let single = vec![Sample {
             item_id: 2,
             ts: NOW,
             views: 400,
         }];
-        let rate = views_per_hour(&single, 2, NOW - 7200, NOW).unwrap();
-        assert!((rate - 200.0).abs() < 1e-6);
+        let velocity = current_velocity(&single, 2, NOW - 7200, NOW).unwrap();
+        assert!((velocity.per_hour - 200.0).abs() < 1e-6);
+        assert_eq!(velocity.basis, VelocityBasis::Estimated);
 
         // A brand-new post is floored at a quarter hour so it cannot divide by zero.
         let fresh = vec![Sample {
@@ -751,8 +1044,118 @@ mod tests {
             ts: NOW,
             views: 10,
         }];
-        let rate = views_per_hour(&fresh, 3, NOW, NOW).unwrap();
-        assert!((rate - 40.0).abs() < 1e-6);
+        let velocity = current_velocity(&fresh, 3, NOW, NOW).unwrap();
+        assert!((velocity.per_hour - 40.0).abs() < 1e-6);
+        assert_eq!(velocity.basis, VelocityBasis::Estimated);
+
+        // No samples at all is not a rate of zero. It is no observation, and the caller must
+        // show nothing rather than a number nothing was measured for.
+        assert_eq!(current_velocity(&[], 4, NOW - 7200, NOW), None);
+    }
+
+    /// The report this was written for: 0 → 10000 → 10000 views over two hours. The post gained
+    /// nothing in the last hour, and the old arithmetic — total gained over the whole history —
+    /// called that 5000 views an hour.
+    #[test]
+    fn no_growth_in_the_recent_interval_is_not_reported_as_the_older_average() {
+        let samples = vec![
+            Sample {
+                item_id: 1,
+                ts: NOW - 7200,
+                views: 0,
+            },
+            Sample {
+                item_id: 1,
+                ts: NOW - 3600,
+                views: 10_000,
+            },
+            Sample {
+                item_id: 1,
+                ts: NOW,
+                views: 10_000,
+            },
+        ];
+        let velocity = current_velocity(&samples, 1, NOW - 7200, NOW).unwrap();
+        assert_eq!(velocity.basis, VelocityBasis::Measured);
+        assert!(
+            velocity.per_hour < 1.0,
+            "the last hour gained nothing, but the rate came out {}",
+            velocity.per_hour
+        );
+    }
+
+    /// A source that stopped answering must not keep showing its last number as today's pace.
+    #[test]
+    fn samples_that_stopped_are_stale_rather_than_current() {
+        let samples = vec![
+            Sample {
+                item_id: 1,
+                ts: NOW - 7200,
+                views: 100,
+            },
+            Sample {
+                item_id: 1,
+                ts: NOW - 3600,
+                views: 700,
+            },
+        ];
+        let velocity = current_velocity(&samples, 1, NOW - 7200, NOW).unwrap();
+        assert_eq!(
+            velocity.basis,
+            VelocityBasis::Stale,
+            "the newest sample is an hour old; that is history, not pace"
+        );
+        // The last measurement is still reported, so the screen can show what was seen and when.
+        assert!((velocity.per_hour - 600.0).abs() < 1e-6);
+        assert_eq!(velocity.observed_at, NOW - 3600);
+    }
+
+    /// An estimate is not a measurement: it says what the post averaged since publication, and
+    /// the score may not treat it as an observed pace.
+    #[test]
+    fn an_estimate_is_never_scored_as_engagement() {
+        let (group, samples) = posts(&[(1, 10, "Təzə xəbər budur", 1, 5000)]);
+        // The fresh sample alone: one observation, so nothing was measured.
+        let single: Vec<Sample> = samples.iter().copied().skip(1).take(1).collect();
+        let baselines = Baselines::from_medians(HashMap::from([(10, 1000.0)]), 1.0);
+        let ranked = rank(
+            &[group],
+            &single,
+            &baselines,
+            Window::Hour,
+            &Weights::default(),
+            NOW,
+        );
+        assert_eq!(ranked[0].outlets[0].relative_velocity, None);
+        assert_eq!(ranked[0].engagement, 0.0);
+        assert_eq!(ranked[0].view_count, 5000);
+        assert_eq!(
+            ranked[0].outlets[0].velocity.unwrap().basis,
+            VelocityBasis::Estimated
+        );
+    }
+
+    /// A view count that no channel has cannot wrap a story's total into a negative number.
+    /// The parse refuses absurd counts, and the sum saturates even if one reaches the database.
+    #[test]
+    fn a_wild_view_count_saturates_the_story_total_instead_of_wrapping_it() {
+        let (group, samples) = posts(&[
+            (1, 10, "Çox böyük rəqəm xəbəri budur", 1, i64::MAX),
+            (2, 20, "Çox böyük rəqəm xəbəri budur", 1, i64::MAX),
+        ]);
+        let ranked = rank(
+            &[group],
+            &samples,
+            &Baselines::empty(),
+            Window::Hour,
+            &Weights::default(),
+            NOW,
+        );
+        assert!(
+            ranked[0].view_count > 0,
+            "the total saturates at the maximum instead of wrapping"
+        );
+        assert!(ranked[0].score.is_finite() && ranked[0].score <= 1.0);
     }
 
     #[test]
@@ -777,11 +1180,12 @@ mod tests {
     fn a_story_scores_only_from_its_own_items_samples() {
         // One slice holds every story's samples, interleaved and with each item's own rows out
         // of order, so an index keyed on anything but the item id would attribute one story's
-        // views to another. Each channel has one item, so a correctly attributed rate is its
-        // own channel's median and every story's engagement is exactly 1.0.
+        // views to another. Each item gained its own channel's median pace over the hour, so a
+        // correctly attributed rate is exactly 1x that channel and every story's engagement is
+        // exactly 1.0.
         let slipped = story(&[(1, 10, "Böyük yol qəzası budur", 2, Some(600), false)]);
-        let single = story(&[(2, 20, "Kiçik kanal xəbəri budur", 2, Some(120), false)]);
-        let risen = story(&[(3, 30, "Orta xəbər belə gəldi", 1, Some(250), false)]);
+        let single = story(&[(2, 20, "Kiçik kanal xəbəri budur", 2, Some(60), false)]);
+        let risen = story(&[(3, 30, "Orta xəbər belə gəldi", 2, Some(150), false)]);
         let (slipped_id, single_id, risen_id) = (
             slipped.items[0].item_id,
             single.items[0].item_id,
@@ -789,30 +1193,36 @@ mod tests {
         );
 
         let samples = vec![
+            // One item's rows newest first, and the others' scattered between them.
             Sample {
                 item_id: slipped_id,
-                ts: NOW - 3600,
+                ts: NOW,
                 views: 600,
             },
             Sample {
                 item_id: single_id,
-                ts: NOW,
-                views: 120,
-            },
-            Sample {
-                item_id: risen_id,
-                ts: NOW,
-                views: 250,
+                ts: NOW - 3600,
+                views: 0,
             },
             Sample {
                 item_id: slipped_id,
-                ts: NOW - 7200,
+                ts: NOW - 3600,
                 views: 0,
             },
             Sample {
                 item_id: risen_id,
+                ts: NOW,
+                views: 150,
+            },
+            Sample {
+                item_id: single_id,
+                ts: NOW,
+                views: 60,
+            },
+            Sample {
+                item_id: risen_id,
                 ts: NOW - 3600,
-                views: 100,
+                views: 0,
             },
         ];
 
@@ -828,29 +1238,35 @@ mod tests {
 
         let slipped = story("Böyük yol qəzası budur");
         assert_eq!(
-            slipped.outlets[0].views_per_hour,
+            slipped.outlets[0]
+                .velocity
+                .map(|velocity| velocity.per_hour),
             Some(600.0),
-            "slope branch, own samples only"
+            "the slope of its own two samples, not another story's"
         );
         assert_eq!(slipped.view_count, 600);
         assert_eq!(slipped.engagement, 1.0);
 
         let single = story("Kiçik kanal xəbəri budur");
         assert_eq!(
-            single.outlets[0].views_per_hour,
+            single.outlets[0].velocity.map(|velocity| velocity.per_hour),
             Some(60.0),
-            "age fallback, own sample only"
+            "its own samples again, and its own channel's median is the divisor"
         );
-        assert_eq!(single.view_count, 120);
+        assert_eq!(
+            single.outlets[0].velocity.map(|velocity| velocity.basis),
+            Some(VelocityBasis::Measured)
+        );
+        assert_eq!(single.view_count, 60);
         assert_eq!(single.engagement, 1.0);
 
         let risen = story("Orta xəbər belə gəldi");
         assert_eq!(
-            risen.outlets[0].views_per_hour,
+            risen.outlets[0].velocity.map(|velocity| velocity.per_hour),
             Some(150.0),
-            "slope branch, own samples only"
+            "and the third story's own samples"
         );
-        assert_eq!(risen.view_count, 250);
+        assert_eq!(risen.view_count, 150);
         assert_eq!(risen.engagement, 1.0);
     }
 
@@ -1002,7 +1418,9 @@ mod tests {
         );
         assert_eq!(ranked[0].engagement, MAX_RELATIVE_VELOCITY);
         assert_eq!(
-            ranked[0].outlets[0].views_per_hour,
+            ranked[0].outlets[0]
+                .velocity
+                .map(|velocity| velocity.per_hour),
             Some(28_800.0),
             "the raw measurement is kept beside the capped ratio"
         );
@@ -1289,6 +1707,104 @@ mod tests {
         ] {
             assert!((0.0..=1.0).contains(&value), "out of range: {value}");
         }
+    }
+
+    /// One outlet with two channels of different size: the contribution is the post that ran
+    /// furthest above its own channel's pace, not the one with the biggest raw number.
+    #[test]
+    fn an_outlet_contributes_its_fastest_relative_post_not_its_absolute_one() {
+        // Both posts gained 1000 views in the hour these fixtures measure. Channel 10 normally
+        // runs at 1000/h, channel 20 at 100/h, so the same raw number means 1x on one and 10x
+        // on the other.
+        let (group, samples) = posts(&[
+            (1, 10, "İki kanalı olan xəbər budur", 1, 1000),
+            (1, 20, "İki kanalı olan xəbər budur", 1, 1000),
+        ]);
+        let baselines = Baselines::from_medians(HashMap::from([(10, 1000.0), (20, 100.0)]), 1.0);
+        let ranked = rank(
+            &[group],
+            &samples,
+            &baselines,
+            Window::Hour,
+            &Weights::default(),
+            NOW,
+        );
+        assert_eq!(
+            ranked[0].outlets.len(),
+            1,
+            "one outlet, however many channels"
+        );
+        assert_eq!(ranked[0].outlets[0].relative_velocity, Some(10.0));
+        assert_eq!(ranked[0].engagement, 10.0);
+    }
+
+    /// The percentile only becomes a percentile at twenty stories: below that every nearest
+    /// rank above the 95th is the largest value itself.
+    #[test]
+    fn the_scale_is_the_maximum_below_twenty_stories_and_a_percentile_above() {
+        let values = |count: usize| -> Vec<f64> {
+            let mut values: Vec<f64> = (0..count).map(|n| n as f64 + 1.0).collect();
+            // One outlier at the top, which is what the percentile exists to discount.
+            values[count - 1] = 1000.0;
+            values
+        };
+        for count in [1, 5, 19] {
+            let values = values(count);
+            assert_eq!(
+                robust_scale(&values),
+                values.iter().copied().fold(0.0, f64::max),
+                "{count} stories: the maximum is the only honest scale"
+            );
+        }
+        for count in [20, 21, 40, 100] {
+            let values = values(count);
+            let scale = robust_scale(&values);
+            assert!(
+                scale < 1000.0,
+                "{count} stories: the outlier must not set it"
+            );
+            assert_eq!(scale, percentile(&values, 95.0), "{count} stories");
+        }
+        assert_eq!(robust_scale(&[]), 0.0);
+    }
+
+    /// The normalizer decides who shares the top, and that is the whole of its effect on the
+    /// order: dividing by one positive number cannot reorder anything else. Measured here,
+    /// because the choice was made on this evidence rather than on the shape of the formula.
+    ///
+    /// Under the maximum only the leader normalises to 1.00. Under the 95th percentile everything
+    /// at or above the percentile clamps to 1.00, so the top one or two stories of a window tie
+    /// and the ranking falls through to its recency tie-break. That tie is bounded — no more
+    /// stories can exceed the percentile than the percentile allows — while the maximum would let
+    /// one outlier push every other story toward zero. Both properties are true, and this test
+    /// keeps both visible instead of hiding the trade-off behind the division.
+    #[test]
+    fn the_normalizer_decides_only_who_shares_the_top() {
+        let values: Vec<f64> = (1..=25).map(|n| n as f64).collect();
+        let max = percentile(&values, 100.0);
+        let p95 = robust_scale(&values);
+        assert_eq!((p95, max), (24.0, 25.0));
+
+        assert_eq!(normalize(values[24], max), 1.0);
+        assert_eq!(normalize(values[23], max), 0.96);
+        assert_eq!(normalize(values[23], p95), 1.0);
+        assert_eq!(normalize(values[24], p95), 1.0);
+        assert_eq!(normalize(values[22], p95), 23.0 / 24.0);
+
+        // Below the percentile the two scales order the stories identically.
+        let order = |scale: f64| {
+            let mut scored: Vec<(usize, f64)> = values[..23]
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index, normalize(*value, scale)))
+                .collect();
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            scored
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(max), order(p95));
     }
 
     #[test]

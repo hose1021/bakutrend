@@ -1,0 +1,80 @@
+name: Pages
+
+# A snapshot of the ranking, published to GitHub Pages. Pages serves files and runs nothing, so
+# the poller runs here, the site is written as files and the files are deployed.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # GitHub's cron is best effort: a run may start late under load, and a repository with no
+    # activity for 60 days stops receiving scheduled runs. `workflow_dispatch` covers both.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and no deployment cancelled halfway: a cancelled run would leave the
+# database cache unsaved.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    # The program keeps its database in the platform data directory, which is `$XDG_DATA_HOME`
+    # on Linux. Naming it here makes the cache path the workflow's own choice instead of an
+    # assumption about this machine.
+    env:
+      XDG_DATA_HOME: ${{ github.workspace }}/.cache
+    steps:
+      - uses: actions/checkout@v7
+
+      # Polls accumulate in one database and it is the only history this program has: Telegram
+      # reports views for about fourteen hours and feeds reach back about a day, so a run that
+      # began from nothing could not fill the week window. The database is the cache.
+      - name: Restore the database
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.cache/bakutrend/bakutrend.sqlite
+          key: db-${{ github.run_id }}
+          restore-keys: db-
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - run: cargo build --release
+
+      # One poll, then 45 pages and 15 number files. A source that fails is reported on the page
+      # rather than failing the run: the ranking it could build is still worth publishing.
+      - name: Write the snapshot
+        run: |
+          ls -l "$XDG_DATA_HOME/bakutrend/" || echo "no database yet: this run starts from nothing"
+          ./target/release/bakutrend --export site
+
+      - name: Save the database
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.cache/bakutrend/bakutrend.sqlite
+          key: db-${{ github.run_id }}
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v5

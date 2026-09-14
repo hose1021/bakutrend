@@ -1,4 +1,4 @@
-//! Text normalization shared by story grouping, citation detection and the local filter.
+//! Text normalization shared by story grouping, citation detection and the text filter.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -92,6 +92,71 @@ pub fn collapse_ws(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A feed field as a reader sees it: no CDATA section, no entities, no markup, no run of
+/// whitespace.
+///
+/// The wrapper is markup around the text, and some publishers escape their own: the Qafqazinfo
+/// feed ships `<description>&lt;![CDATA[Manşet…]]&gt;</description>`, so the section arrives as
+/// literal text and comes into view only once the entities are decoded. It is stripped after
+/// decoding for that reason, and the unescaped form is stripped by the same pass.
+pub fn plain_text(input: &str) -> String {
+    let decoded = decode_entities(input);
+    let trimmed = decoded.trim();
+    let text = trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|rest| rest.strip_suffix("]]>"))
+        .unwrap_or(trimmed);
+    collapse_ws(&drop_markup(text))
+}
+
+/// Drop markup, leaving a space where a tag stood.
+///
+/// Feeds put markup in the fields a reader reads: Haqqin.az sends
+/// `<p><img src="…" /></p>Президент США выступил…`, and a body printed as it arrives opens with a
+/// tag instead of a sentence. The space matters where the tag stood between two words —
+/// `başlayır<br>Ətraflı:` is two words and must not become one.
+fn drop_markup(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let Some(start) = rest.find('<') else {
+            out.push_str(rest);
+            return out;
+        };
+        let Some(end) = tag_end(&rest[start + 1..]) else {
+            // An unterminated `<` closes nothing, so it is the publisher's text, not markup.
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        rest = &rest[start + end + 2..];
+    }
+}
+
+/// The offset of the `>` that closes the tag whose name starts this slice, or `None` when this
+/// `<` starts no tag. A quote holds a `>` inside an attribute, and a `<` followed by anything
+/// but a name, a closing slash, a comment or a declaration is a character: in `Artım <1%` the
+/// publisher wrote "less than", and dropping from there would delete the rest of the sentence.
+fn tag_end(after: &str) -> Option<usize> {
+    let mut chars = after.char_indices();
+    match chars.next() {
+        Some((_, glyph)) if glyph.is_ascii_alphabetic() || matches!(glyph, '/' | '!' | '?') => {}
+        _ => return None,
+    }
+    let mut quote: Option<char> = None;
+    for (index, glyph) in chars {
+        match quote {
+            Some(open) if glyph == open => quote = None,
+            Some(_) => {}
+            None if matches!(glyph, '"' | '\'') => quote = Some(glyph),
+            None if glyph == '>' => return Some(index),
+            None => {}
+        }
+    }
+    None
+}
+
 const STOPWORDS: &[&str] = &[
     "olan",
     "ucun",
@@ -169,15 +234,6 @@ pub fn tokens(input: &str) -> Vec<String> {
         seen.insert(fold(&run.join(" ")).replace(' ', "_"));
     }
     seen.into_iter().collect()
-}
-
-/// True when the folded text contains any folded keyword. Used by the local filter.
-pub fn matches_any(input: &str, keywords: &[String]) -> bool {
-    let folded = fold(input);
-    keywords.iter().any(|k| {
-        let needle = fold(k);
-        !needle.is_empty() && folded.contains(&needle)
-    })
 }
 
 /// A place name carries no event on its own, so it is a weaker grouping signal than
@@ -330,8 +386,13 @@ pub fn entities(input: &str) -> Vec<Entity> {
     // Proper-noun runs: detected on the raw text, before folding destroys case. A run
     // also ends after a word that carries trailing punctuation — `Bakı, Azərbaycan`
     // names two things, not one phrase.
+    //
+    // The trailing empty word terminates the last run, so a headline that ends on a name
+    // (`danışdı İlham Əliyev`) yields the same entity as one that ends on punctuation
+    // (`danışdı İlham Əliyev.`). Without it the run is still pending when the loop ends and
+    // is dropped, and the entity depends on how the headline happens to be punctuated.
     let mut run: Vec<&str> = Vec::new();
-    for word in words {
+    for word in words.iter().copied().chain(std::iter::once("")) {
         let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
         let capitalized = bare.chars().next().is_some_and(char::is_uppercase)
             && bare.chars().any(char::is_alphabetic);
@@ -353,23 +414,27 @@ pub fn entities(input: &str) -> Vec<Entity> {
         .collect()
 }
 
+/// The citation markers, one token sequence each, so `istinadlar` is not `istinadla`.
+///
+/// This table is the only one in the program. Detection (`source::is_cited`) and attribution
+/// (`cited_outlet`) read the same markers, and a second copy would let the two disagree: an item
+/// flagged as a repeat whose credited outlet could never be found, or a credit that was never
+/// noted as one. It lives here because `source` already depends on `text`, and the reverse would
+/// invert that layering.
+pub const CITATION_MARKERS: &[&[&str]] = &[
+    &["istinaden"],
+    &["istinadla"],
+    &["melumatina", "gore"],
+    &["сообщает"],
+    &["передает"],
+    &["ссылаясь"],
+    &["по", "данным"],
+];
+
 /// The outlet a text credits, when a citation marker names one. `None` when no marker
 /// is present or the tokens before it hold no usable name — never guess an outlet that
 /// is not written in the text.
 pub fn cited_outlet(input: &str) -> Option<String> {
-    // Mirror of the marker table in `src/source/mod.rs`, which holds the same list for
-    // `is_cited`. text.rs cannot depend on `source` (that would invert the existing
-    // layering: source already depends on text).
-    const CITATION_MARKERS: &[&[&str]] = &[
-        &["istinaden"],
-        &["istinadla"],
-        &["melumatina", "gore"],
-        &["сообщает"],
-        &["передает"],
-        &["ссылаясь"],
-        &["по", "данным"],
-    ];
-
     let folded = fold(input);
     let folded_tokens: Vec<&str> = folded
         .split(|c: char| !c.is_alphanumeric())
@@ -473,6 +538,31 @@ mod tests {
         assert_eq!(collapse_ws("  Bakıda   bu\n\nyollar "), "Bakıda bu yollar");
     }
 
+    /// A body arrives with the publisher's markup in it, and the card prints the body.
+    #[test]
+    fn plain_text_drops_markup_and_keeps_the_words() {
+        assert_eq!(
+            plain_text(
+                r#"<p><img src="https://i.haqqin.az/x.jpg" width="190" border="0" /></p>Президент США выступил"#
+            ),
+            "Президент США выступил"
+        );
+        // A tag between two words is a boundary, not nothing.
+        assert_eq!(plain_text("başlayır<br>Ətraflı:"), "başlayır Ətraflı:");
+        // A `>` inside an attribute does not close the tag.
+        assert_eq!(plain_text(r#"<a title="a>b">Mətn</a>"#), "Mətn");
+        assert_eq!(plain_text("<![CDATA[Adi mətn.]]>"), "Adi mətn.");
+    }
+
+    /// A `<` that starts no tag is the publisher's own character, not markup.
+    #[test]
+    fn plain_text_keeps_a_less_than_that_starts_no_tag() {
+        assert_eq!(plain_text("Artım &lt;1% olub"), "Artım <1% olub");
+        assert_eq!(plain_text("5 < 6"), "5 < 6");
+        // Nothing closes it, so nothing is dropped.
+        assert_eq!(plain_text("Səhv <b başlıq"), "Səhv <b başlıq");
+    }
+
     #[test]
     fn tokens_drops_short_words_stopwords_and_duplicates_and_sorts() {
         assert_eq!(
@@ -508,6 +598,36 @@ mod tests {
                 kind: EntityKind::Other,
             }]
         );
+    }
+
+    /// A name at the very end of a headline is still a name. The run only ended when a
+    /// non-capitalized word or trailing punctuation arrived, so a headline that finished on a
+    /// capitalized run never emitted it and the entity depended on the punctuation.
+    #[test]
+    fn a_name_run_at_the_end_of_a_headline_is_kept() {
+        let with_period = entities("danışdı İlham Əliyev.");
+        let at_end = entities("danışdı İlham Əliyev");
+        assert_eq!(
+            at_end, with_period,
+            "the trailing period must not decide the entity"
+        );
+        assert_eq!(
+            at_end.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            vec!["ilham_eliyev"]
+        );
+
+        // Punctuation still separates two names, and the second one is at the end.
+        assert_eq!(
+            entities("İlham Əliyev, Mehriban Əliyeva")
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ilham_eliyev", "mehriban_eliyeva"]
+        );
+
+        // A single capitalized word is still not a run, whatever it ends with.
+        assert!(entities("Sabah yağış gözlənilir").is_empty());
+        assert!(entities("Yağış gözlənilir Sabah").is_empty());
     }
 
     #[test]
@@ -587,12 +707,5 @@ mod tests {
             tokens("Bakıda bu yollar bağlıdır"),
             vec!["baglidir", "bakida", "yollar"]
         );
-    }
-
-    #[test]
-    fn matches_any_folds_both_sides() {
-        let keywords = vec!["Bakı".to_string(), "Qarabağ".to_string()];
-        assert!(matches_any("Gəncədə QARABAĞ yolu", &keywords));
-        assert!(!matches_any("Tramp Zelenski ilə danışdı", &keywords));
     }
 }

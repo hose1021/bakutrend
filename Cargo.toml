@@ -3,11 +3,15 @@ name = "bakutrend"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Rank Azerbaijani news by popularity in the last hour, day or week"
+description = "Rank Azerbaijani news into a prominence index for the last hour, day or week"
 license = "MIT"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
+
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 directories = "6"

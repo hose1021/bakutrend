@@ -9,23 +9,66 @@ use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
 use crate::text::{cited_outlet, collapse_ws, decode_entities};
 
 /// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number, and groups
-/// thousands with a no-break space (`12 345`). A value that fails to parse would silently drop
-/// the post's engagement signal, so every kind of whitespace is stripped, not just the ends.
+/// thousands with a no-break space (`12 345`).
+///
+/// The accepted formats are exactly these, and nothing else is a count:
+///
+/// - a run of digits, with single spaces (any kind of whitespace, including the no-break space
+///   Telegram uses) allowed between digit groups as a thousands separator;
+/// - an optional `.` or `,` followed by digits, as the fraction of a `K` or `M` suffix;
+/// - an optional `K`, `k`, `M` or `m` suffix.
+///
+/// Anything else is rejected rather than guessed at: `NaN`, `inf`, a negative number, an empty
+/// string, text around the number, and any value above [`MAX_VIEWS`] — which no post reaches, so
+/// a number that large means the parse went wrong. A rejected count is dropped, and the post
+/// then has no measurement rather than a wrong one.
 pub fn parse_views(raw: &str) -> Option<i64> {
-    let cleaned = raw.replace(',', ".");
-    let cleaned = cleaned.split_whitespace().collect::<String>();
+    const MAX_VIEWS: f64 = 1e12;
+    let cleaned: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
     if cleaned.is_empty() {
         return None;
     }
-    let (digits, multiplier) = match cleaned.chars().last()? {
-        'K' | 'k' => (&cleaned[..cleaned.len() - 1], 1_000.0),
-        'M' | 'm' => (&cleaned[..cleaned.len() - 1], 1_000_000.0),
-        _ => (cleaned.as_str(), 1.0),
+
+    let (digits, multiplier) = if let Some(rest) = cleaned.strip_suffix(['K', 'k']) {
+        (rest, 1_000.0)
+    } else if let Some(rest) = cleaned.strip_suffix(['M', 'm']) {
+        (rest, 1_000_000.0)
+    } else {
+        (cleaned.as_str(), 1.0)
     };
-    digits
-        .parse::<f64>()
-        .ok()
-        .map(|value| (value * multiplier).round() as i64)
+    if digits.is_empty() {
+        return None;
+    }
+
+    // A suffix may carry one fraction, written with either separator: `2.65K`, `2,65K`. Without
+    // a suffix there is no fractional part to read, so `12.5` is not a count.
+    let mut parts = digits.split(['.', ',']);
+    let whole = parts.next()?;
+    let fraction = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value = match fraction {
+        Some(fraction) => {
+            if multiplier == 1.0
+                || fraction.is_empty()
+                || !fraction.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            // The fraction is read as written: `2.65K` is 2.65 thousand.
+            format!("{whole}.{fraction}").parse::<f64>().ok()?
+        }
+        None => whole.parse::<f64>().ok()?,
+    };
+    let views = value * multiplier;
+    if !views.is_finite() || views < 0.0 || views > MAX_VIEWS {
+        return None;
+    }
+    Some(views.round() as i64)
 }
 
 pub fn parse(html: &str) -> ParseOutcome {
@@ -130,6 +173,47 @@ mod tests {
         assert_eq!(parse_views("12\u{a0}345"), Some(12_345));
         assert_eq!(parse_views("453 000"), Some(453_000));
         assert_eq!(parse_views(""), None);
+    }
+
+    /// A value that is not a count is not a count, and must not become a measurement. Each one
+    /// here would otherwise reach the score as a number nobody published.
+    #[test]
+    fn parse_views_refuses_anything_the_supported_formats_do_not_cover() {
+        for raw in [
+            "",
+            " ",
+            "\u{a0}",
+            "NaN",
+            "nan",
+            "inf",
+            "Infinity",
+            "-5",
+            "-2.5K",
+            "1e6",
+            "abc",
+            "2.65KK",
+            "1..2",
+            "12,5",
+            "K",
+            "M",
+            "1,",
+            "99999999999999",
+            "٣٤",
+        ] {
+            assert_eq!(
+                parse_views(raw),
+                None,
+                "{raw:?} must not become a measurement"
+            );
+        }
+
+        // And the supported formats, fixed here so a change to them is deliberate: digits with
+        // whitespace between groups, an optional fraction written with `.` or `,`, and an
+        // optional K or M suffix.
+        assert_eq!(parse_views("0"), Some(0));
+        assert_eq!(parse_views("2,65K"), Some(2650));
+        assert_eq!(parse_views("9.9M"), Some(9_900_000));
+        assert_eq!(parse_views("1 234 567"), Some(1_234_567));
     }
 
     #[test]

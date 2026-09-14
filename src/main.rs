@@ -1,8 +1,9 @@
-//! Composition root: resolve paths, open the store, then either run the poller alone
-//! or run the TUI with the poller on its own thread.
+//! Composition root: resolve paths, open the store, then run the poller alone, the web
+//! server, or the TUI with the poller on its own thread.
 
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -12,7 +13,8 @@ use bakutrend::cli::Cli;
 use bakutrend::config::Config;
 use bakutrend::dirs::AppDirs;
 use bakutrend::error::{ConfigError, StoreError};
-use bakutrend::poller::{Backoff, poll_once};
+use bakutrend::i18n::Lang;
+use bakutrend::poller::{Backoff, poll_and_record};
 use bakutrend::source::http::HttpFetcher;
 use bakutrend::source::{SourceKind, SourceSpec};
 use bakutrend::store::Store;
@@ -54,7 +56,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         reset_database(&db_path)?;
     }
 
-    let config = resolve_config(cli.config.as_deref(), default_config_path.as_deref())?;
+    let mut config = resolve_config(cli.config.as_deref(), default_config_path.as_deref())?;
+    // The flag wins over the file. Both are validated: `Config::load` refuses a language it
+    // does not know, and clap refuses one for `--lang`, so this assignment cannot smuggle in a
+    // value the screen would then have to guess about.
+    if let Some(lang) = &cli.lang {
+        config.language.clone_from(lang);
+    }
+    // Resolved once and copied into the threads that write user-visible text: a status line is
+    // part of the screen, and a Russian screen with an English failure in it is half a
+    // translation.
+    let lang = Lang::parse(&config.language).unwrap_or(Lang::En);
 
     if let (Some(level), Some(dirs)) = (cli.log.as_deref(), dirs.as_ref()) {
         init_file_logger(level, &dirs.log_path());
@@ -68,6 +80,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     ensure_google_seed(&mut store)?;
 
     let now = chrono::Utc::now().timestamp();
+
+    // The web server needs the poller to keep ranking; the poller keeps its write
+    // connection on its own thread, exactly as the TUI does.
+    if cli.serve || cli.bind.is_some() {
+        let bind = cli.bind.unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        return run_web(store, config, &db_path, &bind);
+    }
+    if let Some(dir) = &cli.export {
+        return run_export(store, config, &db_path, dir);
+    }
     if cli.poll_only {
         return run_poller_forever(store, config, now);
     }
@@ -88,18 +110,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         // The read loop ended: the TUI would go deaf with no explanation (I12).
-        let _ = input_tx.send(AppEvent::InputFailed("keyboard input failed".into()));
+        let _ = input_tx.send(AppEvent::InputFailed(
+            lang.strings().keyboard_failed.to_string(),
+        ));
     });
 
     let interval = Duration::from_secs(config.poll_interval_secs.max(30));
     let poll_tx = tx.clone();
-    let retention_days = config.retention.view_sample_days;
+    // The thread needs its own copy: `config` is still used below to build the UI, and a
+    // `move` closure would take it.
+    let poll_config = config.clone();
     thread::spawn(move || {
         let mut store = store;
         let mut backoff = Backoff::new();
         loop {
             let now = chrono::Utc::now().timestamp();
-            match poll_once(&mut store, &fetcher, &mut backoff, now, retention_days) {
+            match poll_and_record(&mut store, &poll_config, &fetcher, &mut backoff, now) {
                 Ok(report) => {
                     if poll_tx.send(AppEvent::PollDone(report)).is_err() {
                         break;
@@ -253,6 +279,94 @@ fn run_tui(
     }
 }
 
+/// Web server + poller thread. The server holds a read-only view; the poller keeps the
+/// ranking snapshots fresh exactly as it does for the TUI, and hands each cycle's report to the
+/// page, which shows the same health the TUI's header does.
+fn run_web(
+    store: Store,
+    config: Config,
+    db_path: &Path,
+    bind: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fetcher = HttpFetcher::new("azerbaycan OR baki OR bakı")?;
+    let poll_config = config.clone();
+    let last_poll: bakutrend::web::LastPoll = Default::default();
+    let reported = Arc::clone(&last_poll);
+    thread::spawn(move || {
+        let mut store = store;
+        let mut backoff = Backoff::new();
+        let interval = Duration::from_secs(poll_config.poll_interval_secs.max(30));
+        loop {
+            let now = chrono::Utc::now().timestamp();
+            match poll_and_record(&mut store, &poll_config, &fetcher, &mut backoff, now) {
+                Ok(report) => {
+                    log::info!(
+                        "poll ok={} new={} samples={} pruned={} failed={}",
+                        report.ok,
+                        report.new_items,
+                        report.samples,
+                        report.pruned,
+                        report.failed.len()
+                    );
+                    *reported.lock().expect("poll report mutex poisoned") = Some(report);
+                }
+                Err(error) => log::error!("poll failed: {error}"),
+            }
+            thread::sleep(interval);
+        }
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(bakutrend::web::serve(db_path, config, bind, last_poll))?;
+    Ok(())
+}
+
+/// One poll, then the site written from the ranking it produced.
+///
+/// The snapshot is one reading of the database, so the poll happens here rather than in a loop
+/// beside it: a page whose health line says `polled 4m ago` should mean this run polled four
+/// minutes before it wrote the page.
+fn run_export(
+    mut store: Store,
+    config: Config,
+    db_path: &Path,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fetcher = HttpFetcher::new("azerbaycan OR baki OR bakı")?;
+    let mut backoff = Backoff::new();
+    let now = chrono::Utc::now().timestamp();
+    let report = match poll_and_record(&mut store, &config, &fetcher, &mut backoff, now) {
+        Ok(report) => {
+            eprintln!(
+                "poll ok={} new={} samples={} pruned={} failed={}",
+                report.ok,
+                report.new_items,
+                report.samples,
+                report.pruned,
+                report.failed.len()
+            );
+            Some(report)
+        }
+        // A poll that failed is not a reason to publish nothing: the store still holds the polls
+        // that worked, and the page carries the failure on its own line.
+        Err(error) => {
+            eprintln!("poll failed: {error}");
+            None
+        }
+    };
+    let written = bakutrend::export::write_site(db_path, &config, report.as_ref(), dir)?;
+    println!(
+        "wrote {} pages, {} files, {} KiB to {}",
+        written.pages,
+        written.files,
+        written.bytes / 1024,
+        written.dir.display()
+    );
+    Ok(())
+}
+
 fn run_poller_forever(
     mut store: Store,
     config: Config,
@@ -263,13 +377,7 @@ fn run_poller_forever(
     let interval = Duration::from_secs(config.poll_interval_secs.max(30));
     loop {
         let now = chrono::Utc::now().timestamp();
-        match poll_once(
-            &mut store,
-            &fetcher,
-            &mut backoff,
-            now,
-            config.retention.view_sample_days,
-        ) {
+        match poll_and_record(&mut store, &config, &fetcher, &mut backoff, now) {
             Ok(report) => eprintln!(
                 "[{}] ok={} new={} samples={} pruned={} failed={}",
                 now,
@@ -289,8 +397,9 @@ fn run_poller_forever(
 /// `http://` and `https://` reach the launcher; anything else is refused and named in
 /// the status line (I8). A spawn failure is surfaced the same way.
 fn open_in_browser(app: &mut App, url: &str) {
+    let text = app.lang.strings();
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        app.status = format!("refusing to open a non-http URL: {url}");
+        app.status = format!("{}: {url}", text.non_http_url);
         return;
     }
     let opener = if cfg!(target_os = "macos") {
@@ -299,7 +408,7 @@ fn open_in_browser(app: &mut App, url: &str) {
         "xdg-open"
     };
     if let Err(error) = std::process::Command::new(opener).arg(url).spawn() {
-        app.status = format!("browser launch failed: {error}");
+        app.status = format!("{}: {error}", text.browser_failed);
     }
 }
 

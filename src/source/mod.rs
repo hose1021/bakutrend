@@ -80,25 +80,32 @@ pub fn section_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// Each marker is its own token sequence, so `istinadlar` is not `istinadla`.
-const CITATION_MARKERS: &[&[&str]] = &[
-    &["istinaden"],
-    &["istinadla"],
-    &["melumatina", "gore"],
-    &["сообщает"],
-    &["передает"],
-    &["ссылаясь"],
-    &["по", "данным"],
-];
+/// The text a citation is looked for in.
+///
+/// Feeds put the attribution in either the headline or the body, and sometimes in both: a short
+/// item may carry everything in its title, an agency note may sit in the summary of a headline
+/// that says nothing about it. Both are searched, because a citation that is only in the title
+/// is still a citation.
+pub fn citation_text(title: &str, description: Option<&str>) -> String {
+    match description {
+        Some(body) if !body.trim().is_empty() => format!("{title} {body}"),
+        _ => title.to_string(),
+    }
+}
 
-/// True when the text credits another outlet. Such an item weighs half in coverage.
+/// True when the text credits another outlet.
+///
+/// A marker means the item says where it came from. It never means the item is original
+/// reporting: the absence of one is the absence of evidence, and this program does not read it
+/// as proof of anything. What the markers do support is the opposite direction — an item that
+/// names another outlet is demonstrably not that outlet's own work.
 pub fn is_cited(text: &str) -> bool {
     let folded = text::fold(text);
     let words: Vec<&str> = folded
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect();
-    CITATION_MARKERS
+    crate::text::CITATION_MARKERS
         .iter()
         .any(|marker| words.windows(marker.len()).any(|run| run == *marker))
 }

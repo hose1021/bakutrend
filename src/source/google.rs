@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::ParseError;
-use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
+use crate::source::{ParseOutcome, ParsedItem, citation_text, is_cited, section_from_url};
 use crate::text::{cited_outlet, collapse_ws, decode_entities};
 
 pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
@@ -44,11 +44,14 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
         let description = entry
             .summary
             .map(|t| collapse_ws(&decode_entities(&t.content)));
+        // Google's results put the attribution in either field: a wire copy carries the marker
+        // in its summary, a rewritten one may keep it in the headline.
+        let citation = citation_text(&title, description.as_deref());
         outcome.items.push(ParsedItem {
             external_id: url.clone(),
             section: section_from_url(&url),
-            cited: is_cited(description.as_deref().unwrap_or_default()),
-            cited_outlet: cited_outlet(description.as_deref().unwrap_or_default()),
+            cited: is_cited(&citation),
+            cited_outlet: cited_outlet(&citation),
             url,
             title,
             description,
@@ -186,6 +189,28 @@ mod tests {
         let out = parse(xml.as_bytes()).expect("parses");
         assert_eq!(out.items[0].title, "Sadə başlıq");
         assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
+    }
+
+    /// Google results carry the attribution in whichever field the outlet filled. A marker in
+    /// the headline alone is a citation, and the publisher suffix is stripped before it is read.
+    #[test]
+    fn a_citation_in_a_google_headline_alone_is_still_a_citation() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item><title>Yanğın söndürülüb - APA-ya istinadən - Day.Az</title>
+        <link>https://news.google.com/rss/articles/cite</link>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az">Day.Az</source></item>
+        <item><title>Sadə başlıq - Day.Az</title>
+        <link>https://news.google.com/rss/articles/plain</link>
+        <pubDate>Mon, 14 Sep 2026 10:00:00 GMT</pubDate>
+        <source url="https://www.day.az">Day.Az</source></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items.len(), 2);
+        assert_eq!(out.items[0].title, "Yanğın söndürülüb - APA-ya istinadən");
+        assert!(out.items[0].cited);
+        assert_eq!(out.items[0].cited_outlet.as_deref(), Some("apa"));
+        assert!(!out.items[1].cited, "no marker found is not a citation");
+        assert_eq!(out.items[1].cited_outlet, None);
     }
 
     /// Attribution is keyed on the item's own link, so one item missing a `<source>` cannot
