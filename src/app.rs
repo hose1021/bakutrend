@@ -8,7 +8,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use crate::cluster::Clusterer;
 use crate::config::Config;
 use crate::poller::PollReport;
-use crate::score::{rank, ScoredStory};
+use crate::score::{ScoredStory, rank};
 use crate::store::{Store, Window};
 use crate::text::matches_any;
 use crate::ui::View;
@@ -102,7 +102,13 @@ impl App {
                 return;
             };
             let groups = clusterer.group_items(&fallback);
-            rank(&groups, &fallback_samples, Window::Week, &self.config.weights, now)
+            rank(
+                &groups,
+                &fallback_samples,
+                Window::Week,
+                &self.config.weights,
+                now,
+            )
         } else {
             self.quiet_fallback = false;
             let groups = clusterer.group_items(&items);
@@ -112,7 +118,10 @@ impl App {
         if self.local_only {
             stories.retain(|story| {
                 matches_any(&story.title, &self.config.local_keywords)
-                    || story.outlets.iter().any(|o| matches_any(&o.title, &self.config.local_keywords))
+                    || story
+                        .outlets
+                        .iter()
+                        .any(|o| matches_any(&o.title, &self.config.local_keywords))
             });
         }
         if !self.filter.is_empty() {
@@ -142,19 +151,30 @@ impl App {
         // so the previous window must end one second earlier. Without the `- 1` an item published
         // exactly on the boundary is ranked in both windows and the delta compares the current
         // list against a set that already contains part of it. The off-by-one is deliberate.
-        let Ok((previous_items, previous_samples)) =
-            self.store.window_data(now - 2 * span, now - span - 1, self.window.allows_backfill())
-        else {
+        let Ok((previous_items, previous_samples)) = self.store.window_data(
+            now - 2 * span,
+            now - span - 1,
+            self.window.allows_backfill(),
+        ) else {
             return None;
         };
         if previous_items.len() < QUIET_THRESHOLD {
             return None;
         }
         let groups = clusterer.group_items(&previous_items);
-        let previous = rank(&groups, &previous_samples, self.window, &self.config.weights, now - span);
+        let previous = rank(
+            &groups,
+            &previous_samples,
+            self.window,
+            &self.config.weights,
+            now - span,
+        );
 
-        let position: HashMap<&str, i64> =
-            previous.iter().enumerate().map(|(index, story)| (story.key.as_str(), index as i64)).collect();
+        let position: HashMap<&str, i64> = previous
+            .iter()
+            .enumerate()
+            .map(|(index, story)| (story.key.as_str(), index as i64))
+            .collect();
         let deltas = current
             .iter()
             .enumerate()
@@ -291,10 +311,10 @@ impl App {
             KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('r') => return Action::ForcePoll,
             KeyCode::Enter => {
-                if let Some(story) = self.stories.get(self.selected) {
-                    if let Some(outlet) = story.outlets.first() {
-                        return Action::OpenUrl(outlet.url.clone());
-                    }
+                if let Some(story) = self.stories.get(self.selected)
+                    && let Some(outlet) = story.outlets.first()
+                {
+                    return Action::OpenUrl(outlet.url.clone());
                 }
             }
             _ => {}
@@ -416,7 +436,11 @@ mod tests {
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        assert_eq!(app.selected, app.stories.len() - 1, "cannot move past the last row");
+        assert_eq!(
+            app.selected,
+            app.stories.len() - 1,
+            "cannot move past the last row"
+        );
     }
 
     #[test]
@@ -464,9 +488,17 @@ mod tests {
         assert!(!app.show_help);
         app.handle_key(key(KeyCode::Char('?')));
         assert!(app.show_help);
-        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None, "Esc closes help first");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)),
+            Action::None,
+            "Esc closes help first"
+        );
         assert!(!app.show_help);
-        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::Quit, "then Esc quits");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)),
+            Action::Quit,
+            "then Esc quits"
+        );
     }
 
     #[test]
@@ -488,8 +520,14 @@ mod tests {
 
         // Push the items outside the hour window.
         app.refresh(NOW + 7200);
-        assert!(app.quiet_fallback, "an empty hour falls back rather than showing nothing");
-        assert!(!app.stories.is_empty(), "the fallback still shows the latest stories");
+        assert!(
+            app.quiet_fallback,
+            "an empty hour falls back rather than showing nothing"
+        );
+        assert!(
+            !app.stories.is_empty(),
+            "the fallback still shows the latest stories"
+        );
     }
 
     #[test]
@@ -497,14 +535,26 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let source_id = seed_source(&mut store);
         let items = vec![
-            parsed("same-a", "Bakıda metro stansiyasında təmir işləri başladı", NOW),
-            parsed("same-b", "Bakıda metro stansiyasında təmir işləri davam edir", NOW - 60),
+            parsed(
+                "same-a",
+                "Bakıda metro stansiyasında təmir işləri başladı",
+                NOW,
+            ),
+            parsed(
+                "same-b",
+                "Bakıda metro stansiyasında təmir işləri davam edir",
+                NOW - 60,
+            ),
         ];
         store.upsert_items(source_id, &items, NOW).unwrap();
 
         let mut app = App::new(store, Config::default(), NOW);
         app.refresh(NOW);
-        assert_eq!(app.stories.len(), 1, "one event is one story, not one story per item");
+        assert_eq!(
+            app.stories.len(),
+            1,
+            "one event is one story, not one story per item"
+        );
     }
 
     #[test]
@@ -517,7 +567,10 @@ mod tests {
         let mut reference = app_with_stories();
         reference.window = Window::Hour;
         reference.refresh(NOW);
-        assert!(!app.stories.is_empty(), "the injected clock is inside the fixture window");
+        assert!(
+            !app.stories.is_empty(),
+            "the injected clock is inside the fixture window"
+        );
         assert_eq!(
             story_keys(&app),
             story_keys(&reference),
@@ -539,7 +592,11 @@ mod tests {
         .iter()
         .enumerate()
         {
-            items.push(parsed(&format!("prev{index}"), title, NOW - DAY - 600 * (index as i64 + 1)));
+            items.push(parsed(
+                &format!("prev{index}"),
+                title,
+                NOW - DAY - 600 * (index as i64 + 1),
+            ));
         }
         store.upsert_items(source_id, &items, NOW).unwrap();
 
@@ -553,7 +610,10 @@ mod tests {
             .expect("the boundary item belongs to the current window")
             .key
             .clone();
-        let deltas = app.deltas.as_ref().expect("three prior items are enough history");
+        let deltas = app
+            .deltas
+            .as_ref()
+            .expect("three prior items are enough history");
         assert!(
             !deltas.contains_key(&boundary_key),
             "an item published at exactly now - span must not rank in the previous window too"
@@ -572,7 +632,11 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('e')));
         assert_eq!(app.filter, "me");
-        assert_eq!(app.stories.len(), 1, "a second character narrows it further");
+        assert_eq!(
+            app.stories.len(),
+            1,
+            "a second character narrows it further"
+        );
 
         app.handle_key(key(KeyCode::Backspace));
         assert_eq!(app.filter, "m");

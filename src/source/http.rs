@@ -7,8 +7,7 @@ use crate::error::FetchError;
 use crate::source::{self, ParseOutcome, SourceKind};
 use crate::store::SourceRow;
 
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) bakutrend/0.1";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) bakutrend/0.1";
 
 /// Anything that can turn a source row into parsed items. Tests supply a fixture-backed
 /// implementation so the whole poll cycle runs offline.
@@ -42,7 +41,10 @@ impl HttpFetcher {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|source| FetchError::Network { url, source })?;
-        Ok(Self { client, google_query: google_query.to_string() })
+        Ok(Self {
+            client,
+            google_query: google_query.to_string(),
+        })
     }
 }
 
@@ -57,14 +59,21 @@ impl Fetcher for HttpFetcher {
             .client
             .get(&url)
             .send()
-            .map_err(|source| FetchError::Network { url: url.clone(), source })?;
+            .map_err(|source| FetchError::Network {
+                url: url.clone(),
+                source,
+            })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(FetchError::Http { status: status.as_u16(), url });
+            return Err(FetchError::Http {
+                status: status.as_u16(),
+                url,
+            });
         }
-        let body = response
-            .bytes()
-            .map_err(|source| FetchError::Network { url: url.clone(), source })?;
+        let body = response.bytes().map_err(|source| FetchError::Network {
+            url: url.clone(),
+            source,
+        })?;
 
         match source.kind {
             SourceKind::Rss => {
@@ -87,7 +96,9 @@ impl Fetcher for HttpFetcher {
 /// thing — a malformed or unsupported channel — and the skips are worth recording.
 fn telegram_outcome(outcome: ParseOutcome, handle: &str) -> Result<ParseOutcome, FetchError> {
     if outcome.items.is_empty() && outcome.skipped == 0 {
-        return Err(FetchError::EmptyPreview { handle: handle.to_string() });
+        return Err(FetchError::EmptyPreview {
+            handle: handle.to_string(),
+        });
     }
     Ok(outcome)
 }
@@ -122,7 +133,10 @@ mod tests {
 
     #[test]
     fn containers_that_all_failed_to_parse_are_skips_not_a_dead_source() {
-        let outcome = ParseOutcome { items: Vec::new(), skipped: 2 };
+        let outcome = ParseOutcome {
+            items: Vec::new(),
+            skipped: 2,
+        };
         let kept = telegram_outcome(outcome, "@apatv").expect("a source that needs no backoff");
         assert_eq!(kept.skipped, 2);
     }

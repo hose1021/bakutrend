@@ -1,7 +1,7 @@
 //! RSS and Atom parsing through `feed-rs`, mapped onto `ParsedItem`.
 
 use crate::error::ParseError;
-use crate::source::{is_cited, section_from_url, ParseOutcome, ParsedItem};
+use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
 use crate::text::{collapse_ws, decode_entities};
 
 /// Parse feed bytes. Items without a link, title or timestamp are skipped and counted.
@@ -79,21 +79,37 @@ mod tests {
         let out = parse(&fixture("modern.rss.xml")).expect("parses");
         assert!(out.items.len() >= 10);
         for item in &out.items {
-            assert!(!item.title.contains("&nbsp;"), "undecoded entity in {:?}", item.title);
-            assert!(!item.title.contains("&ldquo;"), "undecoded entity in {:?}", item.title);
+            assert!(
+                !item.title.contains("&nbsp;"),
+                "undecoded entity in {:?}",
+                item.title
+            );
+            assert!(
+                !item.title.contains("&ldquo;"),
+                "undecoded entity in {:?}",
+                item.title
+            );
         }
     }
 
     #[test]
     fn section_is_taken_from_the_url_path() {
-        assert_eq!(section_from_url("https://apa.az/incident/x-995704").as_deref(), Some("incident"));
-        assert_eq!(section_from_url("https://www.qafqazinfo.az/news/detail/x-521389").as_deref(), Some("news"));
+        assert_eq!(
+            section_from_url("https://apa.az/incident/x-995704").as_deref(),
+            Some("incident")
+        );
+        assert_eq!(
+            section_from_url("https://www.qafqazinfo.az/news/detail/x-521389").as_deref(),
+            Some("news")
+        );
         assert_eq!(section_from_url("https://azertag.az/").as_deref(), None);
     }
 
     #[test]
     fn is_cited_detects_agency_attribution() {
-        assert!(is_cited("“Qafqazinfo” APA-ya istinadən xəbər verir ki, hadisə olub"));
+        assert!(is_cited(
+            "“Qafqazinfo” APA-ya istinadən xəbər verir ki, hadisə olub"
+        ));
         assert!(is_cited("TASS-a istinadla məlumat yayılıb"));
         assert!(!is_cited("Bakıda bu yollar bağlıdır"));
     }

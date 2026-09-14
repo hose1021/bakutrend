@@ -48,10 +48,16 @@ mod tests {
 
     #[test]
     fn resolved_paths_are_branded_and_distinct() {
-        let Some(dirs) = AppDirs::resolve() else { return };
+        let Some(dirs) = AppDirs::resolve() else {
+            return;
+        };
         assert!(dirs.db_path().to_string_lossy().contains("bakutrend"));
         assert!(dirs.db_path().ends_with("bakutrend.sqlite"));
-        assert!(dirs.config_path().to_string_lossy().ends_with("config.toml"));
+        assert!(
+            dirs.config_path()
+                .to_string_lossy()
+                .ends_with("config.toml")
+        );
         assert!(dirs.log_path().to_string_lossy().contains("bakutrend"));
     }
 }

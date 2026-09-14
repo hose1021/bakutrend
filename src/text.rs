@@ -93,10 +93,48 @@ pub fn collapse_ws(input: &str) -> String {
 }
 
 const STOPWORDS: &[&str] = &[
-    "olan", "ucun", "daha", "olub", "deye", "barede", "sonra", "artiq", "hansi", "nece", "bele",
-    "onun", "hemcinin", "bunu", "butun", "gore", "ile", "ile", "kimi", "ancaq", "lakin", "yeni",
-    "этот", "который", "также", "было", "сообщает", "передает", "которая", "которые", "что",
-    "для", "как", "они", "его", "уже", "будет", "может", "своих", "своей", "только", "очень",
+    "olan",
+    "ucun",
+    "daha",
+    "olub",
+    "deye",
+    "barede",
+    "sonra",
+    "artiq",
+    "hansi",
+    "nece",
+    "bele",
+    "onun",
+    "hemcinin",
+    "bunu",
+    "butun",
+    "gore",
+    "ile",
+    "ile",
+    "kimi",
+    "ancaq",
+    "lakin",
+    "yeni",
+    "этот",
+    "который",
+    "также",
+    "было",
+    "сообщает",
+    "передает",
+    "которая",
+    "которые",
+    "что",
+    "для",
+    "как",
+    "они",
+    "его",
+    "уже",
+    "будет",
+    "может",
+    "своих",
+    "своей",
+    "только",
+    "очень",
 ];
 
 /// Significant words of a headline: folded, split, at least 4 characters, no stopwords.
@@ -142,7 +180,10 @@ mod tests {
     #[test]
     fn decode_entities_handles_html_entities_feed_rs_leaves_escaped() {
         assert_eq!(decode_entities("a&nbsp;b"), "a b");
-        assert_eq!(decode_entities("&ldquo;Sitat&rdquo;"), "\u{201c}Sitat\u{201d}");
+        assert_eq!(
+            decode_entities("&ldquo;Sitat&rdquo;"),
+            "\u{201c}Sitat\u{201d}"
+        );
         assert_eq!(decode_entities("x &mdash; y"), "x \u{2014} y");
         assert_eq!(decode_entities("&#39;"), "'");
     }
@@ -160,7 +201,10 @@ mod tests {
 
     #[test]
     fn tokens_drops_short_words_stopwords_and_duplicates_and_sorts() {
-        assert_eq!(tokens("Bakıda bu yollar bağlıdır"), vec!["baglidir", "bakida", "yollar"]);
+        assert_eq!(
+            tokens("Bakıda bu yollar bağlıdır"),
+            vec!["baglidir", "bakida", "yollar"]
+        );
         assert!(tokens("və bu ki").is_empty());
     }
 

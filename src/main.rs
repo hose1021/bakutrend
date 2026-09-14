@@ -339,8 +339,10 @@ mod tests {
             outlet: "APATV".to_string(),
             enabled,
         };
-        let mut config = Config::default();
-        config.sources = vec![source(false)];
+        let mut config = Config {
+            sources: vec![source(false)],
+            ..Default::default()
+        };
 
         register_sources(&mut store, &config).unwrap();
         assert!(
@@ -369,8 +371,12 @@ mod tests {
             name: format!("{outlet} Telegram"),
             locator: locator.to_string(),
         };
-        store.ensure_source(&channel("APA", "@apa_az"), true).unwrap();
-        store.ensure_source(&channel("Day.az", "@dayaz"), true).unwrap();
+        store
+            .ensure_source(&channel("APA", "@apa_az"), true)
+            .unwrap();
+        store
+            .ensure_source(&channel("Day.az", "@dayaz"), true)
+            .unwrap();
         store
             .ensure_source(
                 &SourceSpec {
@@ -383,14 +389,16 @@ mod tests {
             )
             .unwrap();
 
-        let mut config = Config::default();
-        config.sources = vec![SourceConfig {
-            name: "APA Telegram".to_string(),
-            kind: "telegram".to_string(),
-            locator: "@apa_az".to_string(),
-            outlet: "APA".to_string(),
-            enabled: true,
-        }];
+        let config = Config {
+            sources: vec![SourceConfig {
+                name: "APA Telegram".to_string(),
+                kind: "telegram".to_string(),
+                locator: "@apa_az".to_string(),
+                outlet: "APA".to_string(),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
 
         register_sources(&mut store, &config).unwrap();
 
@@ -425,14 +433,16 @@ mod tests {
             )
             .unwrap();
 
-        let mut config = Config::default();
-        config.sources = vec![SourceConfig {
-            name: "APA RSS".to_string(),
-            kind: "rss".to_string(),
-            locator: "https://apa.az/rss".to_string(),
-            outlet: "APA".to_string(),
-            enabled: true,
-        }];
+        let config = Config {
+            sources: vec![SourceConfig {
+                name: "APA RSS".to_string(),
+                kind: "rss".to_string(),
+                locator: "https://apa.az/rss".to_string(),
+                outlet: "APA".to_string(),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
 
         register_sources(&mut store, &config).unwrap();
 
@@ -446,7 +456,8 @@ mod tests {
             "the config named this locator as rss, so the telegram row is not polled"
         );
         assert!(
-            rows.iter().any(|row| row.kind == SourceKind::Rss && row.enabled),
+            rows.iter()
+                .any(|row| row.kind == SourceKind::Rss && row.enabled),
             "the rss row the config names is polled"
         );
     }
@@ -480,7 +491,10 @@ mod tests {
             .into_iter()
             .find(|row| row.id == id)
             .expect("the seed row survives");
-        assert!(row.enabled, "a disabled seed row never runs, and nothing says why");
+        assert!(
+            row.enabled,
+            "a disabled seed row never runs, and nothing says why"
+        );
     }
 
     #[test]

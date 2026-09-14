@@ -105,7 +105,9 @@ mod tests {
 
     #[test]
     fn is_cited_matches_whole_tokens_only() {
-        assert!(is_cited("“Qafqazinfo” APA-ya istinadən xəbər verir ki, hadisə olub"));
+        assert!(is_cited(
+            "“Qafqazinfo” APA-ya istinadən xəbər verir ki, hadisə olub"
+        ));
         assert!(is_cited("TASS-a istinadla məlumat yayılıb"));
         assert!(is_cited("Məlumatına görə, hadisə gecə baş verib"));
         assert!(!is_cited("Bakıda bu yollar bağlıdır"));
@@ -116,8 +118,14 @@ mod tests {
     #[test]
     fn section_from_url_ignores_query_and_fragment() {
         assert_eq!(section_from_url("https://host?next=/foo"), None);
-        assert_eq!(section_from_url("https://host/path?x=1").as_deref(), Some("path"));
-        assert_eq!(section_from_url("https://host/path#frag").as_deref(), Some("path"));
+        assert_eq!(
+            section_from_url("https://host/path?x=1").as_deref(),
+            Some("path")
+        );
+        assert_eq!(
+            section_from_url("https://host/path#frag").as_deref(),
+            Some("path")
+        );
         assert_eq!(section_from_url("https://host"), None);
         assert_eq!(section_from_url("https://azertag.az/"), None);
     }

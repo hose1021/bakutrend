@@ -203,7 +203,11 @@ mod tests {
     #[test]
     fn similarity_is_jaccard_over_token_sets() {
         let a = vec!["bakida".to_string(), "yollar".to_string()];
-        let b = vec!["bakida".to_string(), "yollar".to_string(), "baglidir".to_string()];
+        let b = vec![
+            "bakida".to_string(),
+            "yollar".to_string(),
+            "baglidir".to_string(),
+        ];
         assert!((similarity(&a, &b) - 2.0 / 3.0).abs() < 1e-9);
         assert_eq!(similarity(&a, &[]), 0.0, "an empty set never matches");
     }
@@ -215,7 +219,12 @@ mod tests {
         let first = clusterer.assign(&mut groups, &item(1, 1, "Bakıda bu yollar bağlıdır", 100));
         let second = clusterer.assign(
             &mut groups,
-            &item(2, 2, "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə", 200),
+            &item(
+                2,
+                2,
+                "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə",
+                200,
+            ),
         );
         assert_eq!(first, second);
         assert_eq!(groups.len(), 1);
@@ -228,7 +237,10 @@ mod tests {
         let clusterer = Clusterer::new(0.45);
         let mut groups = Vec::new();
         clusterer.assign(&mut groups, &item(1, 1, "Bakıda bu yollar bağlıdır", 100));
-        clusterer.assign(&mut groups, &item(2, 2, "İstinadən: Bakıda bu yollar bağlıdır", 200));
+        clusterer.assign(
+            &mut groups,
+            &item(2, 2, "İstinadən: Bakıda bu yollar bağlıdır", 200),
+        );
         assert_eq!(groups.len(), 1);
     }
 
@@ -236,9 +248,19 @@ mod tests {
     fn different_events_sharing_one_word_stay_apart() {
         let clusterer = Clusterer::new(0.45);
         let mut groups = Vec::new();
-        clusterer.assign(&mut groups, &item(1, 1, "Gəncədə iki nəfər bıçaqlandı", 100));
-        clusterer.assign(&mut groups, &item(2, 2, "Gəncədə toy karvanı qəza etdi", 200));
-        assert_eq!(groups.len(), 2, "a shared place name must not merge two events");
+        clusterer.assign(
+            &mut groups,
+            &item(1, 1, "Gəncədə iki nəfər bıçaqlandı", 100),
+        );
+        clusterer.assign(
+            &mut groups,
+            &item(2, 2, "Gəncədə toy karvanı qəza etdi", 200),
+        );
+        assert_eq!(
+            groups.len(),
+            2,
+            "a shared place name must not merge two events"
+        );
     }
 
     #[test]
@@ -246,7 +268,12 @@ mod tests {
         let clusterer = Clusterer::new(0.45);
         let items = vec![
             item(1, 1, "Bakıda bu yollar bağlıdır", 100),
-            item(2, 2, "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə", 200),
+            item(
+                2,
+                2,
+                "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə",
+                200,
+            ),
             item(3, 3, "Tamamilə fərqli bir xəbər budur", 150),
         ];
         let groups = clusterer.group_items(&items);
@@ -270,8 +297,16 @@ mod tests {
         }
         let grouped = clusterer.group_items(&items);
 
-        assert_eq!(assigned.len(), 1, "at threshold 0 even a disjoint headline matches");
-        assert_eq!(grouped.len(), 1, "group_items must agree with assign at threshold 0");
+        assert_eq!(
+            assigned.len(),
+            1,
+            "at threshold 0 even a disjoint headline matches"
+        );
+        assert_eq!(
+            grouped.len(),
+            1,
+            "group_items must agree with assign at threshold 0"
+        );
     }
 
     #[test]
@@ -281,7 +316,10 @@ mod tests {
         assert_eq!(signature(&[]), "");
 
         let long = |last: &str| -> Vec<String> {
-            ["a", "b", "c", "d", "e", "f", last].iter().map(|s| s.to_string()).collect()
+            ["a", "b", "c", "d", "e", "f", last]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         };
         assert_ne!(
             signature(&long("g")),
@@ -303,13 +341,23 @@ mod tests {
 
         let groups = clusterer.group_items(&items);
 
-        assert_eq!(groups.len(), 2, "untokenized headlines can never match anything");
+        assert_eq!(
+            groups.len(),
+            2,
+            "untokenized headlines can never match anything"
+        );
         assert_eq!(groups[0].key, "untokenized:1");
         assert_eq!(groups[1].key, "untokenized:2");
-        assert_ne!(groups[0].key, groups[1].key, "duplicate keys overwrite each other in Task 12");
+        assert_ne!(
+            groups[0].key, groups[1].key,
+            "duplicate keys overwrite each other in Task 12"
+        );
 
         let again = clusterer.group_items(&items);
-        assert_eq!(again[0].key, groups[0].key, "the key must not move between polls");
+        assert_eq!(
+            again[0].key, groups[0].key,
+            "the key must not move between polls"
+        );
     }
 
     #[test]
@@ -321,14 +369,23 @@ mod tests {
 
         let groups = Clusterer::new(5.0).group_items(&items);
 
-        assert_eq!(groups.len(), 1, "5.0 clamps to 1.0, so identical headlines still merge");
+        assert_eq!(
+            groups.len(),
+            1,
+            "5.0 clamps to 1.0, so identical headlines still merge"
+        );
     }
 
     #[test]
     fn a_nan_threshold_falls_back_to_the_default() {
         let identical = vec![
             item(1, 1, "Bakıda bu yollar bağlıdır", 100),
-            item(2, 2, "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə", 200),
+            item(
+                2,
+                2,
+                "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə",
+                200,
+            ),
         ];
         let unrelated = vec![
             item(1, 1, "Gəncədə iki nəfər bıçaqlandı", 100),

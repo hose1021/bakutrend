@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use bakutrend::cluster::Clusterer;
 use bakutrend::error::FetchError;
 use bakutrend::poller::{Backoff, poll_once};
-use bakutrend::score::{rank, Weights};
+use bakutrend::score::{Weights, rank};
 use bakutrend::source::http::Fetcher;
 use bakutrend::source::{ParseOutcome, SourceKind, SourceSpec};
 use bakutrend::store::{SourceRow, Store, Window};
@@ -66,7 +66,10 @@ impl Fetcher for FixtureFetcher {
         let body = self
             .bodies
             .get(&source.locator)
-            .ok_or_else(|| FetchError::Http { status: 404, url: source.locator.clone() })?;
+            .ok_or_else(|| FetchError::Http {
+                status: 404,
+                url: source.locator.clone(),
+            })?;
         match source.kind {
             SourceKind::Rss => {
                 bakutrend::source::rss::parse(body).map_err(|source| FetchError::Parse {
@@ -144,7 +147,11 @@ fn one_poll_ingests_every_source_and_produces_a_ranked_list() {
     let report = poll_once(&mut store, &fetcher, &mut Backoff::new(), now, 30).unwrap();
     assert_eq!(report.failed, Vec::<(String, String)>::new());
     assert_eq!(report.ok, 3);
-    assert!(report.new_items >= 50, "expected a real ingest, got {}", report.new_items);
+    assert!(
+        report.new_items >= 50,
+        "expected a real ingest, got {}",
+        report.new_items
+    );
     assert_eq!(
         report.new_items as i64,
         store.item_count().unwrap(),
@@ -158,7 +165,10 @@ fn one_poll_ingests_every_source_and_produces_a_ranked_list() {
     assert!(!groups.is_empty());
     // Real headlines from different outlets do merge; a no-op clusterer would return one group
     // per item. Which headlines merge is Task 6's deterministic concern, not this test's.
-    assert!(groups.len() < items.len(), "the clusterer grouped something");
+    assert!(
+        groups.len() < items.len(),
+        "the clusterer grouped something"
+    );
 
     let ranked = rank(&groups, &samples, Window::Week, &Weights::default(), now);
     assert!(!ranked.is_empty());
@@ -166,9 +176,15 @@ fn one_poll_ingests_every_source_and_produces_a_ranked_list() {
         ranked.windows(2).all(|pair| pair[0].score >= pair[1].score),
         "sorted best first, every adjacent pair"
     );
-    assert!(ranked[0].score > 0.0, "real coverage, engagement and freshness score above zero");
-    assert!(ranked[0].outlets.len() >= 1);
-    assert!(ranked.iter().all(|s| s.coverage >= 0.5), "every story has someone carrying it");
+    assert!(
+        ranked[0].score > 0.0,
+        "real coverage, engagement and freshness score above zero"
+    );
+    assert!(!ranked[0].outlets.is_empty());
+    assert!(
+        ranked.iter().all(|s| s.coverage >= 0.5),
+        "every story has someone carrying it"
+    );
 }
 
 #[test]
@@ -188,10 +204,19 @@ fn the_same_poll_run_twice_reranks_identically() {
     // second read against a later clock would move every score for reasons that are not the data.
     let reading = |store: &Store| {
         let (items, samples) = store.window(Window::Week, now).unwrap();
-        rank(&Clusterer::new(0.45).group_items(&items), &samples, Window::Week, &Weights::default(), now)
+        rank(
+            &Clusterer::new(0.45).group_items(&items),
+            &samples,
+            Window::Week,
+            &Weights::default(),
+            now,
+        )
     };
     let summary = |stories: &[bakutrend::score::ScoredStory]| {
-        stories.iter().map(|s| (s.title.clone(), s.coverage, s.score)).collect::<Vec<_>>()
+        stories
+            .iter()
+            .map(|s| (s.title.clone(), s.coverage, s.score))
+            .collect::<Vec<_>>()
     };
     let first = summary(&reading(&store));
     assert!(!first.is_empty());
@@ -201,8 +226,15 @@ fn the_same_poll_run_twice_reranks_identically() {
     assert_eq!(second_report.failed, Vec::<(String, String)>::new());
     assert_eq!(second_report.ok, 3);
     assert_eq!(second_report.new_items, 0, "unchanged feeds insert nothing");
-    assert_eq!(store.item_count().unwrap(), ingested, "and leave the store the same size");
+    assert_eq!(
+        store.item_count().unwrap(),
+        ingested,
+        "and leave the store the same size"
+    );
 
     let second = summary(&reading(&store));
-    assert_eq!(first, second, "re-polling unchanged feeds must not change the ranking inputs");
+    assert_eq!(
+        first, second,
+        "re-polling unchanged feeds must not change the ranking inputs"
+    );
 }

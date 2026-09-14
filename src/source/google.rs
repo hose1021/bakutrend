@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::ParseError;
-use crate::source::{is_cited, section_from_url, ParseOutcome, ParsedItem};
+use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
 use crate::text::{collapse_ws, decode_entities};
 
 pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
@@ -69,7 +69,9 @@ fn item_publishers(xml: &str) -> BTreeMap<String, String> {
             continue;
         }
         let block = &rest[start..];
-        let Some(end) = block.find("</item>") else { break };
+        let Some(end) = block.find("</item>") else {
+            break;
+        };
         let block = &block[..end];
         if let (Some(link), Some(source)) =
             (element_text(block, "link"), element_text(block, "source"))
@@ -102,7 +104,9 @@ fn strip_tags(input: &str) -> String {
     let mut rest = input;
     while let Some(open) = rest.find('<') {
         out.push_str(&rest[..open]);
-        let Some(end) = tag_end(rest, open) else { return out };
+        let Some(end) = tag_end(rest, open) else {
+            return out;
+        };
         rest = &rest[end..];
     }
     out.push_str(rest);

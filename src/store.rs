@@ -211,12 +211,21 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (id, kind, name, locator, outlet, enabled) = row?;
-            let Some(kind) = SourceKind::parse(&kind) else { continue };
+            let Some(kind) = SourceKind::parse(&kind) else {
+                continue;
+            };
             let enabled = enabled != 0;
             if only_enabled && !enabled {
                 continue;
             }
-            out.push(SourceRow { id, kind, name, locator, outlet, enabled });
+            out.push(SourceRow {
+                id,
+                kind,
+                name,
+                locator,
+                outlet,
+                enabled,
+            });
         }
         Ok(out)
     }
@@ -282,12 +291,16 @@ impl Store {
     fn source_kind(&self, source_id: i64) -> Result<SourceKind, StoreError> {
         let raw: String =
             self.conn
-                .query_row("SELECT kind FROM sources WHERE id = ?1", [source_id], |r| r.get(0))?;
+                .query_row("SELECT kind FROM sources WHERE id = ?1", [source_id], |r| {
+                    r.get(0)
+                })?;
         Ok(SourceKind::parse(&raw).unwrap_or(SourceKind::Rss))
     }
 
     pub fn item_count(&self) -> Result<i64, StoreError> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?)
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?)
     }
 
     /// Items and the view samples belonging to those items, for a time range.
@@ -329,10 +342,22 @@ impl Store {
         let mut items = Vec::new();
         for row in mapped {
             let (
-                item_id, source_id, outlet_id, outlet, kind, title, description, url,
-                published_at, views, cited, is_backfill,
+                item_id,
+                source_id,
+                outlet_id,
+                outlet,
+                kind,
+                title,
+                description,
+                url,
+                published_at,
+                views,
+                cited,
+                is_backfill,
             ) = row?;
-            let Some(kind) = SourceKind::parse(&kind) else { continue };
+            let Some(kind) = SourceKind::parse(&kind) else {
+                continue;
+            };
             items.push(ItemRow {
                 item_id,
                 source_id,
@@ -397,7 +422,9 @@ impl Store {
     }
 
     pub fn prune_samples(&mut self, before: i64) -> Result<usize, StoreError> {
-        Ok(self.conn.execute("DELETE FROM view_samples WHERE ts < ?1", [before])?)
+        Ok(self
+            .conn
+            .execute("DELETE FROM view_samples WHERE ts < ?1", [before])?)
     }
 }
 
@@ -406,12 +433,17 @@ impl Store {
 fn resolve_outlet_in(conn: &Connection, name: &str) -> Result<i64, StoreError> {
     let key = outlet_key(name);
     let existing: Option<i64> = conn
-        .query_row("SELECT id FROM outlets WHERE key = ?1", [&key], |r| r.get(0))
+        .query_row("SELECT id FROM outlets WHERE key = ?1", [&key], |r| {
+            r.get(0)
+        })
         .optional()?;
     if let Some(id) = existing {
         return Ok(id);
     }
-    conn.execute("INSERT INTO outlets (name, key) VALUES (?1, ?2)", rusqlite::params![name, key])?;
+    conn.execute(
+        "INSERT INTO outlets (name, key) VALUES (?1, ?2)",
+        rusqlite::params![name, key],
+    )?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -445,7 +477,9 @@ mod tests {
 
     fn fixture() -> (Store, i64) {
         let mut store = Store::open_in_memory().expect("memory store");
-        let source_id = store.ensure_source(&spec("APA", "APA RSS", "https://apa.az/rss"), true).unwrap();
+        let source_id = store
+            .ensure_source(&spec("APA", "APA RSS", "https://apa.az/rss"), true)
+            .unwrap();
         (store, source_id)
     }
 
@@ -476,8 +510,18 @@ mod tests {
         let (mut store, source_id) = fixture();
         let items = vec![item("a", "Bakıda yollar bağlıdır", 1_700_000_000)];
 
-        assert_eq!(store.upsert_items(source_id, &items, 1_700_000_000).unwrap(), 1);
-        assert_eq!(store.upsert_items(source_id, &items, 1_700_000_300).unwrap(), 0);
+        assert_eq!(
+            store
+                .upsert_items(source_id, &items, 1_700_000_000)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .upsert_items(source_id, &items, 1_700_000_300)
+                .unwrap(),
+            0
+        );
         assert_eq!(store.item_count().unwrap(), 1);
     }
 
@@ -485,16 +529,28 @@ mod tests {
     fn upsert_refreshes_last_seen_without_touching_published_at() {
         let (mut store, source_id) = fixture();
         let items = vec![item("a", "Başlıq", 1_700_000_000)];
-        store.upsert_items(source_id, &items, 1_700_000_000).unwrap();
-        store.upsert_items(source_id, &items, 1_700_000_900).unwrap();
+        store
+            .upsert_items(source_id, &items, 1_700_000_000)
+            .unwrap();
+        store
+            .upsert_items(source_id, &items, 1_700_000_900)
+            .unwrap();
 
         let first_seen: i64 = store
             .conn
-            .query_row("SELECT first_seen FROM items WHERE external_id = 'a'", [], |r| r.get(0))
+            .query_row(
+                "SELECT first_seen FROM items WHERE external_id = 'a'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let last_seen: i64 = store
             .conn
-            .query_row("SELECT last_seen FROM items WHERE external_id = 'a'", [], |r| r.get(0))
+            .query_row(
+                "SELECT last_seen FROM items WHERE external_id = 'a'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(first_seen, 1_700_000_000);
         assert_eq!(last_seen, 1_700_000_900);
@@ -503,17 +559,35 @@ mod tests {
     #[test]
     fn one_outlet_publishing_two_feeds_is_one_outlet() {
         let mut store = Store::open_in_memory().unwrap();
-        let rss = store.ensure_source(&spec("Qafqazinfo", "Qafqazinfo RSS", "https://qafqazinfo.az/rss"), true).unwrap();
-        let tg = store.ensure_source(&spec("Qafqazinfo", "Qafqazinfo Telegram", "@qafqazinfo"), true).unwrap();
+        let rss = store
+            .ensure_source(
+                &spec("Qafqazinfo", "Qafqazinfo RSS", "https://qafqazinfo.az/rss"),
+                true,
+            )
+            .unwrap();
+        let tg = store
+            .ensure_source(
+                &spec("Qafqazinfo", "Qafqazinfo Telegram", "@qafqazinfo"),
+                true,
+            )
+            .unwrap();
         assert_ne!(rss, tg, "sources are distinct rows");
-        let outlets: i64 = store.conn.query_row("SELECT COUNT(*) FROM outlets", [], |r| r.get(0)).unwrap();
+        let outlets: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM outlets", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(outlets, 1, "both sources belong to one outlet");
     }
 
     #[test]
     fn google_items_credit_the_named_publisher_not_the_seed_source() {
         let mut store = Store::open_in_memory().unwrap();
-        store.ensure_source(&spec("Report", "Report RSS", "https://report.az/rss/"), true).unwrap();
+        store
+            .ensure_source(
+                &spec("Report", "Report RSS", "https://report.az/rss/"),
+                true,
+            )
+            .unwrap();
         let seed = store
             .ensure_source(
                 &SourceSpec {
@@ -528,7 +602,9 @@ mod tests {
 
         let mut backfill = item("g1", "Bakıda yol qəzası", 1_700_000_000);
         backfill.publisher = Some("Report.az".to_string());
-        store.upsert_items(seed, &[backfill], 1_700_000_000).unwrap();
+        store
+            .upsert_items(seed, &[backfill], 1_700_000_000)
+            .unwrap();
 
         let credited: String = store
             .conn
@@ -538,7 +614,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(credited, "Report", "Report.az must resolve to the existing Report outlet");
+        assert_eq!(
+            credited, "Report",
+            "Report.az must resolve to the existing Report outlet"
+        );
     }
 
     #[test]
@@ -547,9 +626,14 @@ mod tests {
             let mut store = Store::open_in_memory().unwrap();
             for (i, outlet) in order.iter().enumerate() {
                 let locator = format!("https://example.az/{i}/rss");
-                store.ensure_source(&spec(outlet, outlet, &locator), true).unwrap();
+                store
+                    .ensure_source(&spec(outlet, outlet, &locator), true)
+                    .unwrap();
             }
-            store.conn.query_row("SELECT COUNT(*) FROM outlets", [], |r| r.get(0)).unwrap()
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM outlets", [], |r| r.get(0))
+                .unwrap()
         }
 
         assert_eq!(outlet_count(["Baku.ws", "Baku Post"]), 2);
@@ -561,7 +645,12 @@ mod tests {
     #[test]
     fn a_later_publisher_moves_the_item_to_the_resolved_outlet() {
         let mut store = Store::open_in_memory().unwrap();
-        store.ensure_source(&spec("Report", "Report RSS", "https://report.az/rss/"), true).unwrap();
+        store
+            .ensure_source(
+                &spec("Report", "Report RSS", "https://report.az/rss/"),
+                true,
+            )
+            .unwrap();
         let seed = store
             .ensure_source(
                 &SourceSpec {
@@ -574,10 +663,18 @@ mod tests {
             )
             .unwrap();
 
-        store.upsert_items(seed, &[item("g1", "Bakıda yol qəzası", 1_700_000_000)], 1_700_000_000).unwrap();
+        store
+            .upsert_items(
+                seed,
+                &[item("g1", "Bakıda yol qəzası", 1_700_000_000)],
+                1_700_000_000,
+            )
+            .unwrap();
         let mut attributed = item("g1", "Bakıda yol qəzası", 1_700_000_000);
         attributed.publisher = Some("Report.az".to_string());
-        store.upsert_items(seed, &[attributed], 1_700_000_600).unwrap();
+        store
+            .upsert_items(seed, &[attributed], 1_700_000_600)
+            .unwrap();
 
         let credited: String = store
             .conn
@@ -587,7 +684,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(credited, "Report", "a publisher that arrives late must reattribute the item");
+        assert_eq!(
+            credited, "Report",
+            "a publisher that arrives late must reattribute the item"
+        );
     }
 
     #[test]
@@ -595,7 +695,9 @@ mod tests {
         fn stored(store: &Store) -> Option<i64> {
             store
                 .conn
-                .query_row("SELECT views FROM items WHERE external_id = 'a'", [], |r| r.get(0))
+                .query_row("SELECT views FROM items WHERE external_id = 'a'", [], |r| {
+                    r.get(0)
+                })
                 .unwrap()
         }
 
@@ -603,26 +705,50 @@ mod tests {
         let mut payload = item("a", "Başlıq", 1_700_000_000);
 
         payload.views = Some(100);
-        store.upsert_items(source_id, &[payload.clone()], 1_700_000_000).unwrap();
+        store
+            .upsert_items(source_id, &[payload.clone()], 1_700_000_000)
+            .unwrap();
         assert_eq!(stored(&store), Some(100));
 
         payload.views = Some(90);
-        store.upsert_items(source_id, &[payload.clone()], 1_700_000_060).unwrap();
-        assert_eq!(stored(&store), Some(100), "a stale lower count must not overwrite a higher one");
+        store
+            .upsert_items(source_id, &[payload.clone()], 1_700_000_060)
+            .unwrap();
+        assert_eq!(
+            stored(&store),
+            Some(100),
+            "a stale lower count must not overwrite a higher one"
+        );
 
         payload.views = Some(150);
-        store.upsert_items(source_id, &[payload.clone()], 1_700_000_120).unwrap();
+        store
+            .upsert_items(source_id, &[payload.clone()], 1_700_000_120)
+            .unwrap();
         assert_eq!(stored(&store), Some(150));
 
         payload.views = None;
-        store.upsert_items(source_id, &[payload.clone()], 1_700_000_180).unwrap();
-        assert_eq!(stored(&store), Some(150), "a parse without views must not erase them");
+        store
+            .upsert_items(source_id, &[payload.clone()], 1_700_000_180)
+            .unwrap();
+        assert_eq!(
+            stored(&store),
+            Some(150),
+            "a parse without views must not erase them"
+        );
 
         payload.views = None;
-        store.upsert_items(source_id, &[item("b", "Views yoxdur", 1_700_000_000)], 1_700_000_240).unwrap();
+        store
+            .upsert_items(
+                source_id,
+                &[item("b", "Views yoxdur", 1_700_000_000)],
+                1_700_000_240,
+            )
+            .unwrap();
         let no_views: Option<i64> = store
             .conn
-            .query_row("SELECT views FROM items WHERE external_id = 'b'", [], |r| r.get(0))
+            .query_row("SELECT views FROM items WHERE external_id = 'b'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(no_views, None, "items that never carried views stay NULL");
     }
@@ -636,7 +762,9 @@ mod tests {
     #[test]
     fn window_excludes_backfill_for_short_windows_only() {
         let mut store = Store::open_in_memory().unwrap();
-        let rss = store.ensure_source(&spec("APA", "APA RSS", "https://apa.az/rss"), true).unwrap();
+        let rss = store
+            .ensure_source(&spec("APA", "APA RSS", "https://apa.az/rss"), true)
+            .unwrap();
         let seed = store
             .ensure_source(
                 &SourceSpec {
@@ -649,11 +777,19 @@ mod tests {
             )
             .unwrap();
         let now = 1_700_000_000;
-        store.upsert_items(rss, &[item("live", "Canlı xəbər", now - 60)], now).unwrap();
-        store.upsert_items(seed, &[item("seed", "Köhnə xəbər", now - 3600)], now).unwrap();
+        store
+            .upsert_items(rss, &[item("live", "Canlı xəbər", now - 60)], now)
+            .unwrap();
+        store
+            .upsert_items(seed, &[item("seed", "Köhnə xəbər", now - 3600)], now)
+            .unwrap();
 
         let (day_items, _) = store.window(Window::Day, now).unwrap();
-        assert_eq!(day_items.len(), 1, "backfill must not appear in the 24h window");
+        assert_eq!(
+            day_items.len(),
+            1,
+            "backfill must not appear in the 24h window"
+        );
         assert_eq!(day_items[0].title, "Canlı xəbər");
 
         let (week_items, _) = store.window(Window::Week, now).unwrap();
@@ -664,7 +800,9 @@ mod tests {
     fn windowed_items_carry_their_outlet_and_kind() {
         let (mut store, id) = telegram_fixture();
         let now = 1_700_000_000;
-        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now)
+            .unwrap();
 
         let (rows, _) = store.window(Window::Hour, now).unwrap();
         assert_eq!(rows.len(), 1);
@@ -678,7 +816,9 @@ mod tests {
     fn disabled_sources_drop_out_of_the_window() {
         let (mut store, id) = telegram_fixture();
         let now = 1_700_000_000;
-        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now)
+            .unwrap();
         store.set_enabled(id, false).unwrap();
         let (rows, _) = store.window(Window::Hour, now).unwrap();
         assert!(rows.is_empty());
@@ -688,7 +828,9 @@ mod tests {
     fn samples_are_recorded_once_per_throttle_window() {
         let (mut store, id) = telegram_fixture();
         let now = 1_700_000_000;
-        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now)
+            .unwrap();
 
         assert_eq!(store.sample_views(now).unwrap(), 1);
         // Same item, five minutes later: inside the ten-minute throttle, so no new row.
@@ -700,7 +842,9 @@ mod tests {
     fn samples_are_read_back_for_the_window_that_owns_the_item() {
         let (mut store, id) = telegram_fixture();
         let now = 1_700_000_000;
-        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now)
+            .unwrap();
         store.sample_views(now).unwrap();
 
         let (_, samples) = store.window(Window::Hour, now).unwrap();
@@ -712,7 +856,9 @@ mod tests {
     fn prune_removes_only_samples_older_than_the_cutoff() {
         let (mut store, id) = telegram_fixture();
         let now = 1_700_000_000;
-        store.upsert_items(id, &[telegram_item("p1", 500, now - 300)], now).unwrap();
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now)
+            .unwrap();
         store.sample_views(now).unwrap();
         store.sample_views(now + 900).unwrap();
 

@@ -5,7 +5,7 @@
 
 use scraper::{Html, Selector};
 
-use crate::source::{is_cited, section_from_url, ParseOutcome, ParsedItem};
+use crate::source::{ParseOutcome, ParsedItem, is_cited, section_from_url};
 use crate::text::{collapse_ws, decode_entities};
 
 /// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number, and groups
@@ -33,8 +33,8 @@ pub fn parse(html: &str) -> ParseOutcome {
     let post_selector = Selector::parse("div.tgme_widget_message").expect("static selector");
     // The post timestamp is the footer anchor's `<time>`; an earlier `<time datetime>` elsewhere
     // in the post (link preview, forwarded header) is not the post time.
-    let time_selector = Selector::parse("a.tgme_widget_message_date time[datetime]")
-        .expect("static selector");
+    let time_selector =
+        Selector::parse("a.tgme_widget_message_date time[datetime]").expect("static selector");
     let views_selector = Selector::parse(".tgme_widget_message_views").expect("static selector");
     let text_selector = Selector::parse(".tgme_widget_message_text").expect("static selector");
     let link_selector = Selector::parse("a.tgme_widget_message_date").expect("static selector");
@@ -71,16 +71,23 @@ pub fn parse(html: &str) -> ParseOutcome {
         let head_html = text_node.inner_html();
         let head_raw = head_html.split("<br").next().unwrap_or_default();
         let title = collapse_ws(&decode_entities(
-            &Html::parse_fragment(head_raw).root_element().text().collect::<String>(),
+            &Html::parse_fragment(head_raw)
+                .root_element()
+                .text()
+                .collect::<String>(),
         ));
-        let title = if title.is_empty() { body.clone() } else { title };
+        let title = if title.is_empty() {
+            body.clone()
+        } else {
+            title
+        };
 
         let url = post
             .select(&link_selector)
             .next()
             .and_then(|a| a.value().attr("href"))
             .map(str::to_string)
-            .unwrap_or_else(|| format!("https://t.me/{}", post_id.replace('/', "/")));
+            .unwrap_or_else(|| format!("https://t.me/{post_id}"));
         let views = post
             .select(&views_selector)
             .next()
@@ -130,10 +137,18 @@ mod tests {
         let ids: std::collections::BTreeSet<_> = out.items.iter().map(|i| &i.external_id).collect();
         assert_eq!(ids.len(), out.items.len(), "post ids must be unique");
         for item in &out.items {
-            assert!(item.url.starts_with("https://t.me/"), "url was {:?}", item.url);
+            assert!(
+                item.url.starts_with("https://t.me/"),
+                "url was {:?}",
+                item.url
+            );
             assert!(item.published_at > 1_600_000_000);
             assert!(item.views.is_some_and(|v| v >= 0));
-            assert!(!item.title.is_empty(), "post {:?} had no title", item.external_id);
+            assert!(
+                !item.title.is_empty(),
+                "post {:?} had no title",
+                item.external_id
+            );
         }
     }
 
@@ -160,8 +175,16 @@ mod tests {
     #[test]
     fn the_title_is_the_first_line_not_the_whole_post() {
         let out = parse(INLINE);
-        assert_eq!(out.items[0].title, "İsmayıllıda maşın aşıb yandı - Sürücü yaralandı");
-        assert!(out.items[0].description.as_deref().is_some_and(|d| d.contains("Ətraflı")));
+        assert_eq!(
+            out.items[0].title,
+            "İsmayıllıda maşın aşıb yandı - Sürücü yaralandı"
+        );
+        assert!(
+            out.items[0]
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("Ətraflı"))
+        );
     }
 
     #[test]
@@ -227,7 +250,8 @@ mod tests {
 
     #[test]
     fn a_page_with_no_post_containers_yields_no_items_and_no_skips() {
-        let out = parse("<html><body><div class=\"tgme_channel_info\">previews off</div></body></html>");
+        let out =
+            parse("<html><body><div class=\"tgme_channel_info\">previews off</div></body></html>");
         assert!(out.items.is_empty());
         assert_eq!(out.skipped, 0);
     }
@@ -239,9 +263,15 @@ mod tests {
         let out = parse(&fixture("bakupost.tg.html"));
         assert!(out.items.len() >= 5, "got {} posts", out.items.len());
         for item in &out.items {
-            assert!(!item.title.contains("<br"), "raw markup leaked into {:?}", item.title);
             assert!(
-                item.description.as_deref().is_some_and(|d| d.len() >= item.title.len()),
+                !item.title.contains("<br"),
+                "raw markup leaked into {:?}",
+                item.title
+            );
+            assert!(
+                item.description
+                    .as_deref()
+                    .is_some_and(|d| d.len() >= item.title.len()),
                 "title must not be longer than the body for post {:?}",
                 item.external_id
             );

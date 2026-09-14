@@ -122,11 +122,9 @@ fn draw_header(frame: &mut Frame, view: &View<'_>, area: Rect) {
         format!(" · /{}", view.filter)
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(
-            " bakutrend — {health} · polled {polled}{local}{filter} "
-        ));
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " bakutrend — {health} · polled {polled}{local}{filter} "
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(window_tabs(view.window)), inner);
@@ -376,16 +374,17 @@ mod tests {
 
     #[test]
     fn the_window_tabs_never_claim_a_count_they_cannot_know() {
-        let stories: Vec<ScoredStory> = (0..5)
-            .map(|i| story(&format!("Xəbər {i}"), 1.0))
-            .collect();
+        let stories: Vec<ScoredStory> = (0..5).map(|i| story(&format!("Xəbər {i}"), 1.0)).collect();
         let screen = render(&base(&stories, None));
         assert!(
             !screen.contains("(0)"),
             "a tab must not report a count it cannot know:\n{screen}"
         );
         for label in ["1h", "24h", "7d"] {
-            assert!(screen.contains(label), "every window keeps its tab:\n{screen}");
+            assert!(
+                screen.contains(label),
+                "every window keeps its tab:\n{screen}"
+            );
         }
     }
 
@@ -420,7 +419,10 @@ mod tests {
         view.quiet_fallback = true;
         let screen = render(&view);
         assert!(screen.contains("Quiet hour"), "{screen}");
-        assert!(screen.contains("database error: disk I/O error"), "{screen}");
+        assert!(
+            screen.contains("database error: disk I/O error"),
+            "{screen}"
+        );
     }
 
     #[test]

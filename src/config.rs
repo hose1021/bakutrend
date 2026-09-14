@@ -17,7 +17,9 @@ pub struct Retention {
 
 impl Default for Retention {
     fn default() -> Self {
-        Self { view_sample_days: 30 }
+        Self {
+            view_sample_days: 30,
+        }
     }
 }
 
@@ -47,10 +49,37 @@ pub struct Config {
 }
 
 const LOCAL_KEYWORDS: &[&str] = &[
-    "Azərbaycan", "Bakı", "Gəncə", "Sumqayıt", "Mingəçevir", "Bərdə", "Lənkəran", "Astara",
-    "Naxçıvan", "Şuşa", "Xankəndi", "Qarabağ", "Şərqi Zəngəzur", "Xəzər", "Abşeron", "Quba",
-    "Qusar", "Şəki", "Yevlax", "Salyan", "Prezident", "Milli Məclis", "Nazirlər Kabineti",
-    "SOCAR", "AZAL", "ADY", "ANAMA", "DİN", "XİN", "MİDA", "CƏB",
+    "Azərbaycan",
+    "Bakı",
+    "Gəncə",
+    "Sumqayıt",
+    "Mingəçevir",
+    "Bərdə",
+    "Lənkəran",
+    "Astara",
+    "Naxçıvan",
+    "Şuşa",
+    "Xankəndi",
+    "Qarabağ",
+    "Şərqi Zəngəzur",
+    "Xəzər",
+    "Abşeron",
+    "Quba",
+    "Qusar",
+    "Şəki",
+    "Yevlax",
+    "Salyan",
+    "Prezident",
+    "Milli Məclis",
+    "Nazirlər Kabineti",
+    "SOCAR",
+    "AZAL",
+    "ADY",
+    "ANAMA",
+    "DİN",
+    "XİN",
+    "MİDA",
+    "CƏB",
 ];
 
 /// The 20 verified sources: 10 RSS feeds and 10 Telegram channels.
@@ -92,13 +121,17 @@ fn default_sources() -> Vec<SourceConfig> {
             enabled: true,
         })
         .collect();
-    sources.extend(telegram.iter().map(|(name, locator, outlet, enabled)| SourceConfig {
-        name: name.to_string(),
-        kind: "telegram".to_string(),
-        locator: locator.to_string(),
-        outlet: outlet.to_string(),
-        enabled: *enabled,
-    }));
+    sources.extend(
+        telegram
+            .iter()
+            .map(|(name, locator, outlet, enabled)| SourceConfig {
+                name: name.to_string(),
+                kind: "telegram".to_string(),
+                locator: locator.to_string(),
+                outlet: outlet.to_string(),
+                enabled: *enabled,
+            }),
+    );
     sources
 }
 
@@ -168,8 +201,19 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.sources.len(), 20);
         let enabled = config.sources.iter().filter(|s| s.enabled).count();
-        assert_eq!(enabled, 19, "apatv ships disabled until it serves a preview again");
-        assert_eq!(config.sources.iter().filter(|s| !s.enabled).map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["APATV Telegram"]);
+        assert_eq!(
+            enabled, 19,
+            "apatv ships disabled until it serves a preview again"
+        );
+        assert_eq!(
+            config
+                .sources
+                .iter()
+                .filter(|s| !s.enabled)
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["APATV Telegram"]
+        );
     }
 
     #[test]
@@ -190,14 +234,19 @@ mod tests {
             spec.kind == SourceKind::Rss && spec.locator == "https://qafqazinfo.az/rss" && *enabled
         }));
         assert!(specs.iter().any(|(spec, _)| {
-            spec.kind == SourceKind::Telegram && spec.locator == "@qafqazinfo" && spec.outlet == "Qafqazinfo"
+            spec.kind == SourceKind::Telegram
+                && spec.locator == "@qafqazinfo"
+                && spec.outlet == "Qafqazinfo"
         }));
     }
 
     #[test]
     fn a_missing_file_falls_back_to_defaults() {
         let config = Config::load(std::path::Path::new("/nonexistent/bakutrend.toml"));
-        assert!(config.is_err(), "an explicit path that does not exist is an error, not a silent default");
+        assert!(
+            config.is_err(),
+            "an explicit path that does not exist is an error, not a silent default"
+        );
     }
 
     #[test]
@@ -219,8 +268,14 @@ mod tests {
 
         let config = Config::load(&path).unwrap();
         assert!((config.weights.coverage - 0.5).abs() < 1e-9);
-        assert!((config.weights.engagement - 0.40).abs() < 1e-9, "an omitted key keeps its default");
-        assert!((config.weights.freshness - 0.20).abs() < 1e-9, "an omitted key keeps its default");
+        assert!(
+            (config.weights.engagement - 0.40).abs() < 1e-9,
+            "an omitted key keeps its default"
+        );
+        assert!(
+            (config.weights.freshness - 0.20).abs() < 1e-9,
+            "an omitted key keeps its default"
+        );
     }
 
     #[test]
@@ -230,7 +285,10 @@ mod tests {
         std::fs::write(&path, "[retention]\n").unwrap();
 
         let config = Config::load(&path).unwrap();
-        assert_eq!(config.retention.view_sample_days, 30, "an omitted key keeps its default");
+        assert_eq!(
+            config.retention.view_sample_days, 30,
+            "an omitted key keeps its default"
+        );
     }
 
     #[test]

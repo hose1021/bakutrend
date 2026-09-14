@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use crate::error::StoreError;
-use crate::source::http::Fetcher;
 use crate::source::SourceKind;
+use crate::source::http::Fetcher;
 use crate::store::Store;
 
 const BACKOFF_BASE_SECS: i64 = 60;
@@ -23,7 +23,9 @@ impl Backoff {
     }
 
     pub fn is_due(&self, source_id: i64, now: i64) -> bool {
-        self.ready_at.get(&source_id).is_none_or(|ready| now >= *ready)
+        self.ready_at
+            .get(&source_id)
+            .is_none_or(|ready| now >= *ready)
     }
 
     pub fn record_ok(&mut self, source_id: i64) {
@@ -60,10 +62,7 @@ pub fn poll_once(
 ) -> Result<PollReport, StoreError> {
     let mut report = PollReport::default();
     let sources = store.sources(true)?;
-    let has_week_data = !store
-        .window(crate::store::Window::Week, now)?
-        .0
-        .is_empty();
+    let has_week_data = !store.window(crate::store::Window::Week, now)?.0.is_empty();
 
     // The Google source is a one-shot seed, never a per-cycle poll.
     for source in sources.iter().filter(|s| s.kind != SourceKind::Google) {
@@ -88,20 +87,19 @@ pub fn poll_once(
     // One-shot week seed: only when no locally observed week data exists yet, and on the same
     // backoff as every other source. A failed seed leaves the week empty, so without the guard
     // an unreachable Google would be retried every cycle forever.
-    if !has_week_data {
-        if let Some(seed) = sources.iter().find(|s| s.kind == SourceKind::Google) {
-            if backoff.is_due(seed.id, now) {
-                match fetcher.fetch(seed) {
-                    Ok(outcome) => {
-                        backoff.record_ok(seed.id);
-                        store.upsert_items(seed.id, &outcome.items, now)?;
-                    }
-                    Err(error) => {
-                        backoff.record_failure(seed.id, now);
-                        log::warn!("google backfill failed: {error}");
-                        report.failed.push((seed.name.clone(), error.to_string()));
-                    }
-                }
+    if !has_week_data
+        && let Some(seed) = sources.iter().find(|s| s.kind == SourceKind::Google)
+        && backoff.is_due(seed.id, now)
+    {
+        match fetcher.fetch(seed) {
+            Ok(outcome) => {
+                backoff.record_ok(seed.id);
+                store.upsert_items(seed.id, &outcome.items, now)?;
+            }
+            Err(error) => {
+                backoff.record_failure(seed.id, now);
+                log::warn!("google backfill failed: {error}");
+                report.failed.push((seed.name.clone(), error.to_string()));
             }
         }
     }
@@ -122,7 +120,10 @@ mod tests {
 
     impl Fetcher for NeverFetcher {
         fn fetch(&self, _source: &crate::store::SourceRow) -> Result<ParseOutcome, FetchError> {
-            Err(FetchError::Http { status: 500, url: "https://example.az".to_string() })
+            Err(FetchError::Http {
+                status: 500,
+                url: "https://example.az".to_string(),
+            })
         }
     }
 
@@ -182,24 +183,38 @@ mod tests {
         let now = 1_700_000_000;
         assert!(backoff.is_due(1, now));
         backoff.record_failure(1, now);
-        assert!(!backoff.is_due(1, now + 30), "not due immediately after a failure");
-        assert!(backoff.is_due(1, now + 61), "due after the first backoff interval");
+        assert!(
+            !backoff.is_due(1, now + 30),
+            "not due immediately after a failure"
+        );
+        assert!(
+            backoff.is_due(1, now + 61),
+            "due after the first backoff interval"
+        );
 
         for step in 1..=12 {
             backoff.record_failure(1, now + step * 3600);
         }
-        assert!(!backoff.is_due(1, now + 12 * 3600 + 1700), "never exceeds the 30 minute cap");
+        assert!(
+            !backoff.is_due(1, now + 12 * 3600 + 1700),
+            "never exceeds the 30 minute cap"
+        );
         assert!(backoff.is_due(1, now + 12 * 3600 + 1801));
 
         backoff.record_ok(1);
-        assert!(backoff.is_due(1, now + 12 * 3600 + 1802), "a success clears the backoff");
+        assert!(
+            backoff.is_due(1, now + 12 * 3600 + 1802),
+            "a success clears the backoff"
+        );
     }
 
     #[test]
     fn polling_twice_changes_nothing_the_second_time() {
         let mut store = store_with_two_sources();
         let mut backoff = Backoff::new();
-        let fetcher = CountingFetcher { calls: std::cell::RefCell::new(Vec::new()) };
+        let fetcher = CountingFetcher {
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
         let now = 1_700_000_000;
 
         let first = poll_once(&mut store, &fetcher, &mut backoff, now, 30).unwrap();
@@ -231,7 +246,10 @@ mod tests {
     impl Fetcher for AlwaysFailingFetcher {
         fn fetch(&self, source: &crate::store::SourceRow) -> Result<ParseOutcome, FetchError> {
             self.calls.borrow_mut().push(source.locator.clone());
-            Err(FetchError::Http { status: 500, url: source.locator.clone() })
+            Err(FetchError::Http {
+                status: 500,
+                url: source.locator.clone(),
+            })
         }
     }
 
@@ -239,7 +257,9 @@ mod tests {
     fn a_failing_google_seed_backs_off_instead_of_retrying_every_cycle() {
         let mut store = store_with_two_sources();
         google_source(&mut store);
-        let fetcher = AlwaysFailingFetcher { calls: std::cell::RefCell::new(Vec::new()) };
+        let fetcher = AlwaysFailingFetcher {
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
         let mut backoff = Backoff::new();
         let now = 1_700_000_000;
         let seeds = || {
@@ -253,12 +273,28 @@ mod tests {
 
         let first = poll_once(&mut store, &fetcher, &mut backoff, now, 30).unwrap();
         assert_eq!(seeds(), 1, "an empty week triggers the seed");
-        assert!(first.failed.iter().any(|(name, _)| name == "Google News AZ"));
+        assert!(
+            first
+                .failed
+                .iter()
+                .any(|(name, _)| name == "Google News AZ")
+        );
 
         let second = poll_once(&mut store, &fetcher, &mut backoff, now + 30, 30).unwrap();
-        assert_eq!(seeds(), 1, "a failed seed waits out its backoff, it does not retry every cycle");
-        assert_eq!(fetcher.calls.borrow().len(), 3, "nothing is retried while backing off");
-        assert!(second.failed.is_empty(), "a skipped source is not reported as a failure");
+        assert_eq!(
+            seeds(),
+            1,
+            "a failed seed waits out its backoff, it does not retry every cycle"
+        );
+        assert_eq!(
+            fetcher.calls.borrow().len(),
+            3,
+            "nothing is retried while backing off"
+        );
+        assert!(
+            second.failed.is_empty(),
+            "a skipped source is not reported as a failure"
+        );
     }
 
     /// Serves one fresh item for every feed source, so a cycle leaves week data behind.
@@ -293,7 +329,9 @@ mod tests {
     fn the_google_source_is_seeded_once_and_never_polled_again() {
         let mut store = store_with_two_sources();
         google_source(&mut store);
-        let fetcher = OneItemFetcher { calls: std::cell::RefCell::new(Vec::new()) };
+        let fetcher = OneItemFetcher {
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
         let mut backoff = Backoff::new();
         let now = 1_700_000_000;
 
@@ -306,8 +344,14 @@ mod tests {
             .filter(|locator| locator.contains("news.google.com"))
             .count();
 
-        assert_eq!(first.ok, 2, "the feed sources are polled, google is not one of them");
+        assert_eq!(
+            first.ok, 2,
+            "the feed sources are polled, google is not one of them"
+        );
         assert_eq!(second.ok, 2);
-        assert_eq!(google_calls, 1, "google seeds the empty week once, not every cycle");
+        assert_eq!(
+            google_calls, 1,
+            "google seeds the empty week once, not every cycle"
+        );
     }
 }
