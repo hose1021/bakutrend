@@ -48,17 +48,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open(&db_path)?;
     register_sources(&mut store, &config)?;
 
-    // The Google source exists only to seed the week window once. It is created here
-    // because it is deliberately absent from the user's configurable source list.
-    store.ensure_source(
-        &SourceSpec {
-            kind: SourceKind::Google,
-            outlet: "Google News".to_string(),
-            name: "Google News 7d".to_string(),
-            locator: "google:7d".to_string(),
-        },
-        true,
-    )?;
+    // The Google source is a one-shot week seed, not a configured source; it has its own
+    // registration path because it is deliberately absent from the configurable list.
+    ensure_google_seed(&mut store)?;
 
     let now = chrono::Utc::now().timestamp();
     if cli.poll_only {
@@ -126,23 +118,45 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// turns a source back on would otherwise never reach the row a previous run disabled.
 ///
 /// The authority runs the other way too: a row the config does not name was left behind by an
-/// earlier run, and polling it would make a replaced `sources` list look ignored. The Google
-/// seed is exempt — it is not configurable, and `poll_once` never loops over it, so disabling it
-/// would only break the one-shot week seed.
+/// earlier run, and polling it would make a replaced `sources` list look ignored. Rows are
+/// matched on `(kind, locator)`, the key `sources` is unique on — a config that reuses a
+/// locator string under another kind names a different row. The Google seed is exempt: it is
+/// not configurable, and `poll_once` never loops over it, so disabling it would only break the
+/// one-shot week seed.
 fn register_sources(store: &mut Store, config: &Config) -> Result<(), StoreError> {
     let mut configured = Vec::new();
     for (spec, enabled) in config.source_specs() {
         let id = store.ensure_source(&spec, enabled)?;
         store.set_enabled(id, enabled)?;
-        configured.push(spec.locator);
+        configured.push((spec.kind, spec.locator));
     }
     for row in store.sources(false)? {
         let configurable = matches!(row.kind, SourceKind::Rss | SourceKind::Telegram);
-        if configurable && !configured.contains(&row.locator) {
+        if configurable && !configured.contains(&(row.kind, row.locator)) {
             store.set_enabled(row.id, false)?;
         }
     }
     Ok(())
+}
+
+/// Register the Google seed row, which is absent from the configurable source list by
+/// design: it exists only to fill the week window once, and `poll_once` keeps it out of the
+/// per-cycle loop. `Store::ensure_source` leaves `enabled` alone on conflict, and
+/// `register_sources` skips Google rows, so nothing else would ever turn this row back on —
+/// the seeder reads it from `Store::sources(true)`, so a row disabled by a hand edit would
+/// leave the 7d window empty with nothing to explain why.
+fn ensure_google_seed(store: &mut Store) -> Result<i64, StoreError> {
+    let id = store.ensure_source(
+        &SourceSpec {
+            kind: SourceKind::Google,
+            outlet: "Google News".to_string(),
+            name: "Google News 7d".to_string(),
+            locator: "google:7d".to_string(),
+        },
+        true,
+    )?;
+    store.set_enabled(id, true)?;
+    Ok(id)
 }
 
 /// Delete the database and the write-ahead log sidecars SQLite keeps beside it. Every path is
@@ -391,6 +405,82 @@ mod tests {
             ["@apa_az", "google:7d"],
             "config decides which rows are polled; the google seed is exempt"
         );
+    }
+
+    /// `sources` is unique on `(kind, locator)`, so a config that reuses a locator string under
+    /// another kind names a different row. Matching on the locator alone would leave that row
+    /// enabled and still polled.
+    #[test]
+    fn a_locator_the_config_names_under_another_kind_is_disabled() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .ensure_source(
+                &SourceSpec {
+                    kind: SourceKind::Telegram,
+                    outlet: "APA".to_string(),
+                    name: "APA Telegram".to_string(),
+                    locator: "https://apa.az/rss".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.sources = vec![SourceConfig {
+            name: "APA RSS".to_string(),
+            kind: "rss".to_string(),
+            locator: "https://apa.az/rss".to_string(),
+            outlet: "APA".to_string(),
+            enabled: true,
+        }];
+
+        register_sources(&mut store, &config).unwrap();
+
+        let rows = store.sources(false).unwrap();
+        let telegram = rows
+            .iter()
+            .find(|row| row.kind == SourceKind::Telegram)
+            .expect("the telegram row survives");
+        assert!(
+            !telegram.enabled,
+            "the config named this locator as rss, so the telegram row is not polled"
+        );
+        assert!(
+            rows.iter().any(|row| row.kind == SourceKind::Rss && row.enabled),
+            "the rss row the config names is polled"
+        );
+    }
+
+    /// The seeder reads the Google row from `Store::sources(true)`, and `register_sources`
+    /// leaves Google alone on purpose. A row left disabled by an earlier run would otherwise
+    /// never seed the week window again.
+    #[test]
+    fn a_disabled_google_seed_row_is_turned_back_on() {
+        let mut store = Store::open_in_memory().unwrap();
+        let seed = |store: &mut Store, enabled: bool| {
+            store
+                .ensure_source(
+                    &SourceSpec {
+                        kind: SourceKind::Google,
+                        outlet: "Google News".to_string(),
+                        name: "Google News 7d".to_string(),
+                        locator: "google:7d".to_string(),
+                    },
+                    enabled,
+                )
+                .unwrap()
+        };
+        let id = seed(&mut store, false);
+
+        ensure_google_seed(&mut store).unwrap();
+
+        let row = store
+            .sources(false)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the seed row survives");
+        assert!(row.enabled, "a disabled seed row never runs, and nothing says why");
     }
 
     #[test]
