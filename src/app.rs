@@ -35,6 +35,9 @@ pub enum Action {
 pub struct App {
     pub store: Store,
     pub config: Config,
+    /// The injected clock. Key handling refreshes at this time, never at the wall clock,
+    /// so a test that drives keys controls the time those refreshes use.
+    pub now: i64,
     pub window: Window,
     pub stories: Vec<ScoredStory>,
     pub deltas: Option<HashMap<String, i64>>,
@@ -64,6 +67,7 @@ impl App {
         let mut app = Self {
             store,
             config,
+            now,
             window: Window::Day,
             stories: Vec::new(),
             deltas: None,
@@ -85,6 +89,7 @@ impl App {
 
     /// Regroup and rerank. Called when data or the window changes, not on every tick.
     pub fn refresh(&mut self, now: i64) {
+        self.now = now;
         let clusterer = Clusterer::new(self.config.cluster_threshold);
         let Ok((items, samples)) = self.store.window(self.window, now) else {
             self.status = "database read failed".to_string();
@@ -133,8 +138,12 @@ impl App {
             return None;
         }
         let span = self.window.seconds();
+        // The current window is `[now - span, now]` and `window_data` is inclusive at both ends,
+        // so the previous window must end one second earlier. Without the `- 1` an item published
+        // exactly on the boundary is ranked in both windows and the delta compares the current
+        // list against a set that already contains part of it. The off-by-one is deliberate.
         let Ok((previous_items, previous_samples)) =
-            self.store.window_data(now - 2 * span, now - span, self.window.allows_backfill())
+            self.store.window_data(now - 2 * span, now - span - 1, self.window.allows_backfill())
         else {
             return None;
         };
@@ -159,6 +168,7 @@ impl App {
     }
 
     pub fn record_poll(&mut self, report: &PollReport, now: i64) {
+        self.now = now;
         self.last_poll = Some(now);
         self.sources_ok = report.ok;
         self.status = if report.failed.is_empty() {
@@ -176,6 +186,12 @@ impl App {
             )
         };
         self.refresh(now);
+    }
+
+    /// Advance the injected clock. The binary calls this once per loop iteration; `refresh` and
+    /// `record_poll` also set it from their own `now` argument.
+    pub fn set_now(&mut self, now: i64) {
+        self.now = now;
     }
 
     pub fn view(&self) -> View<'_> {
@@ -202,8 +218,7 @@ impl App {
             AppEvent::Input(Event::Resize(..)) => Action::None,
             AppEvent::Input(_) => Action::None,
             AppEvent::PollDone(report) => {
-                let now = chrono::Utc::now().timestamp();
-                self.record_poll(&report, now);
+                self.record_poll(&report, self.now);
                 Action::None
             }
             AppEvent::PollFailed(message) => {
@@ -222,16 +237,16 @@ impl App {
                 KeyCode::Esc => {
                     self.filter.clear();
                     self.filter_mode = false;
-                    self.refresh(chrono::Utc::now().timestamp());
+                    self.refresh(self.now);
                 }
                 KeyCode::Enter => self.filter_mode = false,
                 KeyCode::Backspace => {
                     self.filter.pop();
-                    self.refresh(chrono::Utc::now().timestamp());
+                    self.refresh(self.now);
                 }
                 KeyCode::Char(c) => {
                     self.filter.push(c);
-                    self.refresh(chrono::Utc::now().timestamp());
+                    self.refresh(self.now);
                 }
                 _ => {}
             }
@@ -270,7 +285,7 @@ impl App {
             }
             KeyCode::Char('l') => {
                 self.local_only = !self.local_only;
-                self.refresh(chrono::Utc::now().timestamp());
+                self.refresh(self.now);
             }
             KeyCode::Char('/') => self.filter_mode = true,
             KeyCode::Char('?') => self.show_help = !self.show_help,
@@ -291,7 +306,7 @@ impl App {
         if self.window != window {
             self.window = window;
             self.selected = 0;
-            self.refresh(chrono::Utc::now().timestamp());
+            self.refresh(self.now);
         }
     }
 }
@@ -303,9 +318,44 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     const NOW: i64 = 1_700_000_000;
+    const DAY: i64 = 86_400;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// An enabled RSS source in an otherwise empty store.
+    fn seed_source(store: &mut Store) -> i64 {
+        store
+            .ensure_source(
+                &SourceSpec {
+                    kind: SourceKind::Rss,
+                    outlet: "APA".into(),
+                    name: "APA RSS".into(),
+                    locator: "https://apa.az/rss".into(),
+                },
+                true,
+            )
+            .unwrap()
+    }
+
+    /// One parsed item for the synthetic fixtures.
+    fn parsed(external_id: &str, title: &str, published_at: i64) -> ParsedItem {
+        ParsedItem {
+            external_id: external_id.to_string(),
+            url: format!("https://apa.az/incident/{external_id}"),
+            title: title.to_string(),
+            description: None,
+            section: None,
+            published_at,
+            views: None,
+            cited: false,
+            publisher: None,
+        }
+    }
+
+    fn story_keys(app: &App) -> Vec<String> {
+        app.stories.iter().map(|story| story.key.clone()).collect()
     }
 
     fn app_with_stories() -> App {
@@ -440,5 +490,97 @@ mod tests {
         app.refresh(NOW + 7200);
         assert!(app.quiet_fallback, "an empty hour falls back rather than showing nothing");
         assert!(!app.stories.is_empty(), "the fallback still shows the latest stories");
+    }
+
+    #[test]
+    fn refresh_groups_headlines_sharing_vocabulary_into_one_story() {
+        let mut store = Store::open_in_memory().unwrap();
+        let source_id = seed_source(&mut store);
+        let items = vec![
+            parsed("same-a", "Bakıda metro stansiyasında təmir işləri başladı", NOW),
+            parsed("same-b", "Bakıda metro stansiyasında təmir işləri davam edir", NOW - 60),
+        ];
+        store.upsert_items(source_id, &items, NOW).unwrap();
+
+        let mut app = App::new(store, Config::default(), NOW);
+        app.refresh(NOW);
+        assert_eq!(app.stories.len(), 1, "one event is one story, not one story per item");
+    }
+
+    #[test]
+    fn key_triggered_refresh_uses_the_injected_clock() {
+        let mut app = app_with_stories();
+        app.set_now(NOW);
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.window, Window::Hour);
+
+        let mut reference = app_with_stories();
+        reference.window = Window::Hour;
+        reference.refresh(NOW);
+        assert!(!app.stories.is_empty(), "the injected clock is inside the fixture window");
+        assert_eq!(
+            story_keys(&app),
+            story_keys(&reference),
+            "the key path must refresh at the injected clock, not the wall clock"
+        );
+    }
+
+    #[test]
+    fn the_previous_window_excludes_an_item_on_the_current_window_boundary() {
+        let mut store = Store::open_in_memory().unwrap();
+        let source_id = seed_source(&mut store);
+        let boundary = "Astara bağçılıq məhsulları ixrac olunur";
+        let mut items = vec![parsed("boundary", boundary, NOW - DAY)];
+        for (index, title) in [
+            "Lənkəranda çay fabriki yenidən açıldı",
+            "Şəkidə ipək emalatxanası genişləndirildi",
+            "Qubada meşə yanğınına nəzarət edilir",
+        ]
+        .iter()
+        .enumerate()
+        {
+            items.push(parsed(&format!("prev{index}"), title, NOW - DAY - 600 * (index as i64 + 1)));
+        }
+        store.upsert_items(source_id, &items, NOW).unwrap();
+
+        let mut app = App::new(store, Config::default(), NOW);
+        app.refresh(NOW);
+
+        let boundary_key = app
+            .stories
+            .iter()
+            .find(|story| story.title == boundary)
+            .expect("the boundary item belongs to the current window")
+            .key
+            .clone();
+        let deltas = app.deltas.as_ref().expect("three prior items are enough history");
+        assert!(
+            !deltas.contains_key(&boundary_key),
+            "an item published at exactly now - span must not rank in the previous window too"
+        );
+    }
+
+    #[test]
+    fn slash_filter_mode_narrows_the_list_and_escape_clears_it() {
+        let mut app = app_with_stories();
+        app.set_now(NOW);
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(app.filter_mode, "slash enters filter mode");
+
+        app.handle_key(key(KeyCode::Char('m')));
+        assert_eq!(app.stories.len(), 4, "typing narrows the list");
+
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.filter, "me");
+        assert_eq!(app.stories.len(), 1, "a second character narrows it further");
+
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.filter, "m");
+        assert_eq!(app.stories.len(), 4, "backspace widens it again");
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.filter_mode, "Esc leaves filter mode");
+        assert!(app.filter.is_empty(), "Esc clears the filter");
+        assert_eq!(app.stories.len(), 5, "the cleared filter shows every story");
     }
 }
