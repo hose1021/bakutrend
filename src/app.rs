@@ -1,15 +1,15 @@
 //! Application state. All mutable state lives here; `ui::draw` is stateless and
 //! `main` is a thin composition root.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 
-use crate::cluster::Clusterer;
+use crate::cluster::{Clusterer, Group};
 use crate::config::Config;
 use crate::poller::PollReport;
 use crate::score::{ScoredStory, rank};
-use crate::store::{Store, Window};
+use crate::store::{ItemRow, Sample, Store, Window};
 use crate::text::matches_any;
 use crate::ui::View;
 
@@ -17,11 +17,19 @@ use crate::ui::View;
 /// back to the latest stories under a visible banner.
 const QUIET_THRESHOLD: usize = 3;
 
+/// The quiet fallback shows at most this many of the week's latest stories (I3).
+const FALLBACK_LIMIT: usize = 12;
+
+/// The tick re-ranks at most once per this many seconds of injected time (I2).
+const REFRESH_INTERVAL_SECS: i64 = 60;
+
 #[derive(Debug)]
 pub enum AppEvent {
     Input(Event),
     PollDone(PollReport),
     PollFailed(String),
+    /// The input thread died; the TUI must say so instead of going deaf (I12).
+    InputFailed(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,23 +55,28 @@ pub struct App {
     pub filter_mode: bool,
     pub quiet_fallback: bool,
     pub show_help: bool,
-    pub sources_ok: usize,
+    pub sources_ok: Option<usize>,
     pub sources_total: usize,
     pub last_poll: Option<i64>,
+    /// Source names that failed and have not succeeded again (I10).
+    pub degraded: Vec<String>,
+    /// The injected clock of the last ranking, for the tick throttle (I2).
+    pub last_refresh: Option<i64>,
     pub status: String,
 }
 
 impl App {
     pub fn new(store: Store, config: Config, now: i64) -> Self {
         // The Google seed is not a polled source, so it does not count toward health.
-        let sources_total = store
-            .sources(true)
-            .map(|rows| {
+        let (sources_total, enumeration_status) = match store.sources(true) {
+            Ok(rows) => (
                 rows.iter()
                     .filter(|row| row.kind != crate::source::SourceKind::Google)
-                    .count()
-            })
-            .unwrap_or(0);
+                    .count(),
+                String::new(),
+            ),
+            Err(error) => (0, format!("source list read failed: {error}")),
+        };
         let mut app = Self {
             store,
             config,
@@ -77,13 +90,15 @@ impl App {
             filter_mode: false,
             quiet_fallback: false,
             show_help: false,
-            sources_ok: 0,
+            sources_ok: None,
             sources_total,
             last_poll: None,
-            status: String::new(),
+            degraded: Vec::new(),
+            last_refresh: None,
+            status: enumeration_status,
         };
-        app.sources_ok = app.sources_total;
         app.refresh(now);
+        app.last_refresh = Some(now);
         app
     }
 
@@ -91,55 +106,96 @@ impl App {
     pub fn refresh(&mut self, now: i64) {
         self.now = now;
         let clusterer = Clusterer::new(self.config.cluster_threshold);
-        let Ok((items, samples)) = self.store.window(self.window, now) else {
+        let span = self.window.seconds();
+        // One grouping over the full context range `[now - 2*span, now]`: a story's key
+        // must not depend on which window is active, and the current and previous
+        // rankings must share one identity (I1).
+        let Ok((context, samples)) =
+            self.store
+                .window_data(now - 2 * span, now, self.window.allows_backfill())
+        else {
             self.status = "database read failed".to_string();
             return;
         };
+        let groups = clusterer.group_items(&context);
 
-        let mut stories = if items.is_empty() && self.window != Window::Week {
-            self.quiet_fallback = true;
-            let Ok((fallback, fallback_samples)) = self.store.window(Window::Week, now) else {
+        self.quiet_fallback = false;
+        let current = window_slice(&groups, now - span, now);
+        let stories = self.apply_filters(
+            &current,
+            rank(&current, &samples, self.window, &self.config.weights, now),
+        );
+
+        // Spec §11: fewer than three stories is quiet — fall back to the latest stories
+        // of the week, and let the banner state exactly what is shown (I3).
+        if stories.len() < QUIET_THRESHOLD && self.window != Window::Week {
+            let Ok((week_items, week_samples)) = self.store.window(Window::Week, now) else {
+                self.status = "database read failed".to_string();
+                self.deltas = None;
+                self.stories = stories;
+                self.selected = self.selected.min(self.stories.len().saturating_sub(1));
                 return;
             };
-            let groups = clusterer.group_items(&fallback);
-            rank(
-                &groups,
-                &fallback_samples,
-                Window::Week,
-                &self.config.weights,
-                now,
-            )
-        } else {
-            self.quiet_fallback = false;
-            let groups = clusterer.group_items(&items);
-            rank(&groups, &samples, self.window, &self.config.weights, now)
-        };
+            let week_groups = clusterer.group_items(&week_items);
+            let latest = latest_groups(&week_groups, FALLBACK_LIMIT);
+            let fallback = self.apply_filters(
+                &latest,
+                rank(
+                    &latest,
+                    &week_samples,
+                    Window::Week,
+                    &self.config.weights,
+                    now,
+                ),
+            );
+            self.quiet_fallback = true;
+            self.deltas = None;
+            self.stories = fallback;
+            self.selected = self.selected.min(self.stories.len().saturating_sub(1));
+            return;
+        }
 
+        self.deltas = self.compute_deltas(&groups, &samples, now, &stories);
+        self.stories = stories;
+        self.selected = self.selected.min(self.stories.len().saturating_sub(1));
+    }
+
+    /// The local filter matches the story title, each item's description and each outlet
+    /// contribution's title (spec §10.1); the text filter matches the folded title.
+    fn apply_filters(&self, groups: &[Group], mut stories: Vec<ScoredStory>) -> Vec<ScoredStory> {
         if self.local_only {
-            stories.retain(|story| {
-                matches_any(&story.title, &self.config.local_keywords)
-                    || story
-                        .outlets
-                        .iter()
-                        .any(|o| matches_any(&o.title, &self.config.local_keywords))
-            });
+            let keys: HashSet<String> = groups
+                .iter()
+                .filter(|group| self.group_is_local(group))
+                .map(|group| group.key.clone())
+                .collect();
+            stories.retain(|story| keys.contains(&story.key));
         }
         if !self.filter.is_empty() {
             let needle = crate::text::fold(&self.filter);
             stories.retain(|story| crate::text::fold(&story.title).contains(&needle));
         }
-        self.quiet_fallback = self.quiet_fallback || stories.len() < QUIET_THRESHOLD;
-
-        self.deltas = self.compute_deltas(&clusterer, now, &stories);
-        self.stories = stories;
-        self.selected = self.selected.min(self.stories.len().saturating_sub(1));
+        stories
     }
 
-    /// Rank the immediately preceding window of equal length and express the change in
-    /// position. `None` means there is not enough history yet, which hides the column.
+    fn group_is_local(&self, group: &Group) -> bool {
+        matches_any(&group.title, &self.config.local_keywords)
+            || group.items.iter().any(|item| {
+                matches_any(&item.title, &self.config.local_keywords)
+                    || item
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| matches_any(d, &self.config.local_keywords))
+            })
+    }
+
+    /// Express the change in position against the immediately preceding window, computed
+    /// from the SAME grouping and the SAME filters as the current ranking (I4). `None`
+    /// means there is nothing comparable, which hides the column.
     fn compute_deltas(
         &self,
-        clusterer: &Clusterer,
+        groups: &[Group],
+        samples: &[Sample],
         now: i64,
         current: &[ScoredStory],
     ) -> Option<HashMap<String, i64>> {
@@ -147,69 +203,98 @@ impl App {
             return None;
         }
         let span = self.window.seconds();
-        // The current window is `[now - span, now]` and `window_data` is inclusive at both ends,
-        // so the previous window must end one second earlier. Without the `- 1` an item published
-        // exactly on the boundary is ranked in both windows and the delta compares the current
-        // list against a set that already contains part of it. The off-by-one is deliberate.
-        let Ok((previous_items, previous_samples)) = self.store.window_data(
-            now - 2 * span,
-            now - span - 1,
-            self.window.allows_backfill(),
-        ) else {
-            return None;
-        };
-        if previous_items.len() < QUIET_THRESHOLD {
+        // The current window is `[now - span, now]`, so the previous one must end one
+        // second earlier: an item published exactly on the boundary must not rank in
+        // both windows. The off-by-one is deliberate.
+        let previous_groups = window_slice(groups, now - 2 * span, now - span - 1);
+        let previous_items: usize = previous_groups.iter().map(|g| g.items.len()).sum();
+        if previous_items < QUIET_THRESHOLD {
             return None;
         }
-        let groups = clusterer.group_items(&previous_items);
-        let previous = rank(
-            &groups,
-            &previous_samples,
-            self.window,
-            &self.config.weights,
-            now - span,
+        let previous = self.apply_filters(
+            &previous_groups,
+            rank(
+                &previous_groups,
+                samples,
+                self.window,
+                &self.config.weights,
+                now - span,
+            ),
         );
+        if previous.is_empty() {
+            return None;
+        }
 
         let position: HashMap<&str, i64> = previous
             .iter()
             .enumerate()
             .map(|(index, story)| (story.key.as_str(), index as i64))
             .collect();
-        let deltas = current
-            .iter()
-            .enumerate()
-            .filter_map(|(index, story)| {
-                position
-                    .get(story.key.as_str())
-                    .map(|old_index| (story.key.clone(), old_index - index as i64))
-            })
-            .collect::<HashMap<_, _>>();
-        Some(deltas)
+        Some(
+            current
+                .iter()
+                .enumerate()
+                .filter_map(|(index, story)| {
+                    position
+                        .get(story.key.as_str())
+                        .map(|old_index| (story.key.clone(), old_index - index as i64))
+                })
+                .collect::<HashMap<_, _>>(),
+        )
     }
 
     pub fn record_poll(&mut self, report: &PollReport, now: i64) {
         self.now = now;
         self.last_poll = Some(now);
-        self.sources_ok = report.ok;
-        self.status = if report.failed.is_empty() {
+        self.sources_ok = Some(report.ok);
+        for (name, _) in &report.failed {
+            if !self.degraded.contains(name) {
+                self.degraded.push(name.clone());
+            }
+        }
+        for name in &report.succeeded {
+            self.degraded.retain(|degraded| degraded != name);
+        }
+        self.status = self.compose_status("");
+        self.refresh(now);
+    }
+
+    /// The status line names every currently degraded source, whatever else went wrong;
+    /// a source in backoff must not vanish from every surface (I10).
+    fn compose_status(&self, message: &str) -> String {
+        let degraded = if self.degraded.is_empty() {
             String::new()
         } else {
             format!(
                 "{} source(s) degraded: {}",
-                report.failed.len(),
-                report
-                    .failed
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                self.degraded.len(),
+                self.degraded.join(", ")
             )
         };
-        self.refresh(now);
+        match (message.is_empty(), degraded.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => degraded,
+            (false, true) => message.to_string(),
+            (false, false) => format!("{message} · {degraded}"),
+        }
     }
 
-    /// Advance the injected clock. The binary calls this once per loop iteration; `refresh` and
-    /// `record_poll` also set it from their own `now` argument.
+    /// Advance the injected clock and re-rank when at least a minute of injected time
+    /// has passed since the last ranking (I2): fresh enough to track the window, rare
+    /// enough not to re-query several times a second.
+    pub fn tick(&mut self, now: i64) {
+        self.now = now;
+        if self
+            .last_refresh
+            .is_none_or(|last| now - last >= REFRESH_INTERVAL_SECS)
+        {
+            self.refresh(now);
+            self.last_refresh = Some(now);
+        }
+    }
+
+    /// Advance the injected clock. `refresh` and `record_poll` also set it from their
+    /// own `now` argument.
     pub fn set_now(&mut self, now: i64) {
         self.now = now;
     }
@@ -227,7 +312,9 @@ impl App {
             sources_ok: self.sources_ok,
             sources_total: self.sources_total,
             last_poll: self.last_poll,
-            now: chrono::Utc::now().timestamp(),
+            degraded: &self.degraded,
+            // Every displayed time comes from the one injected clock (I2).
+            now: self.now,
             status: &self.status,
         }
     }
@@ -242,7 +329,11 @@ impl App {
                 Action::None
             }
             AppEvent::PollFailed(message) => {
-                self.status = message;
+                self.status = self.compose_status(&message);
+                Action::None
+            }
+            AppEvent::InputFailed(message) => {
+                self.status = self.compose_status(&message);
                 Action::None
             }
         }
@@ -329,6 +420,44 @@ impl App {
             self.refresh(self.now);
         }
     }
+}
+
+/// The groups whose items fall inside `[from, to]`, each trimmed to those items. The
+/// key and tokens stay the shared grouping's, so identity is stable across windows
+/// and across the current/previous rankings (I1).
+fn window_slice(groups: &[Group], from: i64, to: i64) -> Vec<Group> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let items: Vec<ItemRow> = group
+                .items
+                .iter()
+                .filter(|item| item.published_at >= from && item.published_at <= to)
+                .cloned()
+                .collect();
+            if items.is_empty() {
+                return None;
+            }
+            let mut sliced = group.clone();
+            sliced.items = items;
+            sliced.item_ids = sliced.items.iter().map(|item| item.item_id).collect();
+            sliced.newest = sliced.items.iter().map(|item| item.published_at).max()?;
+            sliced.oldest = sliced
+                .items
+                .iter()
+                .map(|item| item.published_at)
+                .min()
+                .unwrap_or(sliced.oldest);
+            Some(sliced)
+        })
+        .collect()
+}
+
+/// The `limit` groups holding the newest items — the quiet fallback's list (I3).
+fn latest_groups(groups: &[Group], limit: usize) -> Vec<Group> {
+    let mut ordered: Vec<&Group> = groups.iter().collect();
+    ordered.sort_by_key(|group| std::cmp::Reverse(group.newest));
+    ordered.into_iter().take(limit).cloned().collect()
 }
 
 #[cfg(test)]
@@ -598,6 +727,17 @@ mod tests {
                 NOW - DAY - 600 * (index as i64 + 1),
             ));
         }
+        // Keep the current window out of quiet fallback so deltas are computed.
+        items.push(parsed(
+            "cur1",
+            "Sumqayıtda zavod yanğını söndürüldü",
+            NOW - 600,
+        ));
+        items.push(parsed(
+            "cur2",
+            "Naxçıvanda yeni magistral yol açıldı",
+            NOW - 1200,
+        ));
         store.upsert_items(source_id, &items, NOW).unwrap();
 
         let mut app = App::new(store, Config::default(), NOW);
@@ -646,5 +786,348 @@ mod tests {
         assert!(!app.filter_mode, "Esc leaves filter mode");
         assert!(app.filter.is_empty(), "Esc clears the filter");
         assert_eq!(app.stories.len(), 5, "the cleared filter shows every story");
+    }
+
+    fn render_app(app: &App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &app.view()))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Spec §13: a cold start has not polled anything, so the header must not claim
+    /// reachability it does not know.
+    #[test]
+    fn a_cold_start_reports_source_health_as_unknown_until_a_poll_reports() {
+        let app = app_with_stories();
+        assert_eq!(app.sources_ok, None);
+        let screen = render_app(&app);
+        assert!(!screen.contains("sources ok"), "{screen}");
+
+        let report = PollReport {
+            ok: 7,
+            ..Default::default()
+        };
+        let mut app = app_with_stories();
+        app.record_poll(&report, NOW);
+        assert_eq!(app.sources_ok, Some(7));
+        let screen = render_app(&app);
+        assert!(screen.contains("7/1 sources ok"), "{screen}");
+    }
+
+    /// I1: one grouping over the full context range, so a story's key cannot change
+    /// with the active window.
+    #[test]
+    fn a_story_spanning_both_windows_keeps_one_key_across_rankings() {
+        let mut store = Store::open_in_memory().unwrap();
+        let source_id = seed_source(&mut store);
+        let items = vec![
+            parsed(
+                "old",
+                "Bakıda metro stansiyasında təmir işləri başladı",
+                NOW - DAY - 3600,
+            ),
+            parsed(
+                "new",
+                "Bakıda metro stansiyasında təmir işləri davam edir",
+                NOW - 3600,
+            ),
+            parsed(
+                "p1",
+                "Lənkəranda çay fabriki yenidən açıldı",
+                NOW - DAY - 600,
+            ),
+            parsed(
+                "p2",
+                "Şəkidə ipək emalatxanası genişləndirildi",
+                NOW - DAY - 1200,
+            ),
+            parsed(
+                "p3",
+                "Qubada meşə yanğınına nəzarət edilir",
+                NOW - DAY - 1800,
+            ),
+            // Enough current-window stories that the day window is not quiet.
+            parsed("c1", "Sumqayıtda zavod yanğını söndürüldü", NOW - 600),
+            parsed("c2", "Naxçıvanda yeni magistral yol açıldı", NOW - 1200),
+        ];
+        store.upsert_items(source_id, &items, NOW).unwrap();
+
+        let mut app = App::new(store, Config::default(), NOW);
+        app.refresh(NOW);
+
+        let spanning = app
+            .stories
+            .iter()
+            .find(|story| story.title.contains("metro"))
+            .expect("the spanning story ranks in the current window")
+            .key
+            .clone();
+        let deltas = app
+            .deltas
+            .as_ref()
+            .expect("three prior items are enough history");
+        assert!(
+            deltas.contains_key(&spanning),
+            "the current and previous rankings must share one key:\n{spanning}"
+        );
+
+        // A story that only exists in the 7d window keeps its key across a switch.
+        let mut store = Store::open_in_memory().unwrap();
+        let source_id = seed_source(&mut store);
+        store
+            .upsert_items(
+                source_id,
+                &[parsed(
+                    "week",
+                    "Zaqatalada qoz bağı genişləndirilir",
+                    NOW - 3 * DAY,
+                )],
+                NOW,
+            )
+            .unwrap();
+        let mut app = App::new(store, Config::default(), NOW);
+        app.refresh(NOW);
+        app.switch_window(Window::Week);
+        let week_key = app
+            .stories
+            .iter()
+            .find(|story| story.title.contains("Zaqatala"))
+            .map(|story| story.key.clone())
+            .expect("the 7d-only story ranks in the week window");
+        app.switch_window(Window::Day);
+        app.switch_window(Window::Week);
+        let again = app
+            .stories
+            .iter()
+            .find(|story| story.title.contains("Zaqatala"))
+            .map(|story| story.key.clone())
+            .expect("the story comes back");
+        assert_eq!(week_key, again);
+    }
+
+    /// I3: fewer than three stories falls back, and the banner states what is shown.
+    #[test]
+    fn a_window_with_two_stories_falls_back_and_labels_the_real_count() {
+        let mut store = Store::open_in_memory().unwrap();
+        let source_id = seed_source(&mut store);
+        let items = vec![
+            parsed(
+                "a",
+                "Bakıda metro stansiyasında təmir işləri başladı",
+                NOW - 60,
+            ),
+            parsed(
+                "b",
+                "Gəncədə toy karvanı qəza etdi, yaralılar var",
+                NOW - 120,
+            ),
+        ];
+        store.upsert_items(source_id, &items, NOW).unwrap();
+        let mut app = App::new(store, Config::default(), NOW);
+        app.window = Window::Hour;
+        app.refresh(NOW);
+
+        assert!(app.quiet_fallback);
+        assert_eq!(app.stories.len(), 2, "the fallback shows what exists");
+        let screen = render_app(&app);
+        assert!(screen.contains("Quiet hour"), "{screen}");
+        assert!(screen.contains("2 stories"), "{screen}");
+        assert!(screen.contains("week"), "{screen}");
+    }
+
+    #[test]
+    fn a_window_with_five_stories_does_not_fall_back() {
+        let mut app = app_with_stories();
+        app.refresh(NOW);
+        assert!(!app.quiet_fallback);
+        assert!(!render_app(&app).contains("Quiet hour"));
+    }
+
+    /// I4: the previous ranking uses the same grouping and the same filters, so a
+    /// filtered-out story cannot distort the movement of the stories that remain.
+    #[test]
+    fn the_local_filter_keeps_the_previous_ranking_honest() {
+        let mut store = Store::open_in_memory().unwrap();
+        let rss = seed_source(&mut store);
+        let second = store
+            .ensure_source(
+                &crate::source::SourceSpec {
+                    kind: crate::source::SourceKind::Rss,
+                    outlet: "Report".into(),
+                    name: "Report RSS".into(),
+                    locator: "https://report.az/rss/".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let items = vec![
+            // A, B and C match the keyword and each spans both windows.
+            parsed(
+                "a-old",
+                "Bakıda metro stansiyasında təmir işləri başladı",
+                NOW - DAY - 300,
+            ),
+            parsed(
+                "a-new",
+                "Bakıda metro stansiyasında təmir işləri başladı",
+                NOW - 300,
+            ),
+            parsed(
+                "b-old",
+                "Bakıda avtobus xətti dəyişdirildi",
+                NOW - DAY - 600,
+            ),
+            parsed("b-new", "Bakıda avtobus xətti dəyişdirildi", NOW - 600),
+            parsed("c-old", "Bakıda park bağlarına baxıldı", NOW - DAY - 900),
+            parsed("c-new", "Bakıda park bağlarına baxıldı", NOW - 900),
+            // D does not match the keyword.
+            parsed(
+                "d-old",
+                "Şəkidə ipək emalatxanası genişləndirildi",
+                NOW - DAY - 150,
+            ),
+            parsed(
+                "d-new",
+                "Şəkidə ipək emalatxanası genişləndirildi",
+                NOW - 150,
+            ),
+        ];
+        // D carries a second outlet, so unfiltered it outranks A, B and C in the
+        // previous window and would distort their movement.
+        let mut extra = parsed(
+            "d-old-2",
+            "Şəkidə ipək emalatxanası genişləndirildi",
+            NOW - DAY - 150,
+        );
+        extra.url = "https://report.az/x".into();
+        store.upsert_items(rss, &items, NOW).unwrap();
+        store.upsert_items(second, &[extra], NOW).unwrap();
+
+        let mut app = App::new(store, Config::default(), NOW);
+        app.config.local_keywords = vec!["Bakı".to_string()];
+        app.local_only = true;
+        app.refresh(NOW);
+
+        let current_keys: Vec<&str> = app.stories.iter().map(|s| s.key.as_str()).collect();
+        let deltas = app.deltas.as_ref().expect("three prior items are history");
+        assert_eq!(current_keys.len(), 3, "the matching stories survive");
+        for key in &current_keys {
+            assert_eq!(
+                deltas.get(*key),
+                Some(&0),
+                "the story's position must not move just because other stories were filtered:\n{deltas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fallback_hides_the_delta_column() {
+        let mut app = app_with_stories();
+        app.window = Window::Hour;
+        app.refresh(NOW + 7200);
+        assert!(app.quiet_fallback);
+        assert!(app.deltas.is_none());
+    }
+
+    /// I6: the local filter matches item descriptions, not only titles.
+    #[test]
+    fn the_local_filter_matches_item_descriptions() {
+        let mut store = Store::open_in_memory().unwrap();
+        let source_id = seed_source(&mut store);
+        let mut item = parsed("desc", "İclas keçirildi", NOW - 60);
+        item.description = Some("Bakıda keçirildi".into());
+        store.upsert_items(source_id, &[item], NOW).unwrap();
+
+        let mut app = App::new(store, Config::default(), NOW);
+        app.local_only = true;
+        app.refresh(NOW);
+        assert!(
+            !app.stories.is_empty(),
+            "the description carries the local relevance"
+        );
+    }
+
+    /// I7: a failed store read must be visible, not silent.
+    #[test]
+    fn a_failed_store_read_sets_a_visible_status() {
+        let mut app = app_with_stories();
+        app.store.conn.execute("DROP TABLE items", []).unwrap();
+        app.refresh(NOW);
+        assert!(!app.status.is_empty(), "{:?}", app.status);
+    }
+
+    /// I10: a degraded source stays named until it succeeds again.
+    #[test]
+    fn a_degraded_source_stays_listed_until_it_succeeds() {
+        let mut app = app_with_stories();
+        app.record_poll(
+            &PollReport {
+                failed: vec![("APA RSS".into(), "500".into())],
+                ..Default::default()
+            },
+            NOW,
+        );
+        assert!(app.degraded.contains(&"APA RSS".to_string()));
+        assert!(app.status.contains("APA RSS"));
+
+        app.record_poll(
+            &PollReport {
+                ok: 1,
+                succeeded: vec!["APA RSS".into()],
+                ..Default::default()
+            },
+            NOW + 60,
+        );
+        assert!(app.degraded.is_empty());
+        assert!(app.status.is_empty());
+    }
+
+    /// I12: a dead input thread must say so.
+    #[test]
+    fn an_input_failure_sets_the_status() {
+        let mut app = app_with_stories();
+        assert!(app.status.is_empty());
+        app.handle(AppEvent::InputFailed("terminal closed".into()));
+        assert!(app.status.contains("terminal closed"));
+    }
+
+    /// I2: the tick re-ranks after 60 seconds of injected time, not before.
+    #[test]
+    fn the_tick_refreshes_after_a_minute_of_injected_time_and_not_sooner() {
+        let mut app = app_with_stories();
+        app.window = Window::Hour;
+        app.refresh(NOW);
+        assert!(!app.quiet_fallback);
+
+        app.tick(NOW + 30);
+        assert!(!app.quiet_fallback, "30s of injected time does not re-rank");
+
+        app.tick(NOW + 7200);
+        assert!(
+            app.quiet_fallback,
+            "an advanced tick re-ranked the empty hour"
+        );
+        // Simulate staleness that only a refresh would repair.
+        app.quiet_fallback = false;
+        app.tick(NOW + 7201);
+        assert!(
+            !app.quiet_fallback,
+            "one second later the tick does not re-rank"
+        );
     }
 }

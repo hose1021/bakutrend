@@ -148,6 +148,26 @@ pub fn tokens(input: &str) -> Vec<String> {
         }
         seen.insert(word.to_string());
     }
+
+    // Spec §9: a run of two or more consecutive capitalized words is a proper-noun
+    // phrase and is kept as ONE extra token, detected before folding destroys the
+    // capitalization. Additive only — the per-word tokens above are untouched, so
+    // similarity between headlines sharing a phrase can only rise.
+    let mut run: Vec<&str> = Vec::new();
+    for word in input.split_whitespace() {
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if bare.chars().next().is_some_and(char::is_uppercase) {
+            run.push(bare);
+        } else if run.len() >= 2 {
+            seen.insert(fold(&run.join(" ")).replace(' ', "_"));
+            run.clear();
+        } else {
+            run.clear();
+        }
+    }
+    if run.len() >= 2 {
+        seen.insert(fold(&run.join(" ")).replace(' ', "_"));
+    }
     seen.into_iter().collect()
 }
 
@@ -206,6 +226,21 @@ mod tests {
             vec!["baglidir", "bakida", "yollar"]
         );
         assert!(tokens("və bu ki").is_empty());
+    }
+    #[test]
+    fn tokens_keeps_a_proper_noun_run_as_one_phrase_token() {
+        let t = tokens("Milli Məclis iclas keçirdi");
+        assert!(
+            t.contains(&"milli_meclis".to_string()),
+            "the run must survive as one token: {t:?}"
+        );
+        assert!(t.contains(&"milli".to_string()));
+        assert!(t.contains(&"meclis".to_string()));
+        // A single capitalized word is not a run: existing tokens are unchanged.
+        assert_eq!(
+            tokens("Bakıda bu yollar bağlıdır"),
+            vec!["baglidir", "bakida", "yollar"]
+        );
     }
 
     #[test]

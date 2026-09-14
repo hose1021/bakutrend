@@ -25,7 +25,14 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
             .get(&url)
             .map(|name| collapse_ws(name))
             .filter(|name| !name.is_empty());
-        let title = strip_publisher_suffix(&raw_title, publisher.as_deref());
+        // An item whose publisher cannot be resolved would fall back to the synthetic
+        // `Google News` outlet in the store and count as a distinct outlet in coverage —
+        // coverage counts distinct outlets, never sources. Drop it instead.
+        let Some(publisher) = publisher else {
+            outcome.skipped += 1;
+            continue;
+        };
+        let title = strip_publisher_suffix(&raw_title, Some(&publisher));
         if title.is_empty() {
             outcome.skipped += 1;
             continue;
@@ -46,7 +53,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParseOutcome, ParseError> {
             description,
             published_at,
             views: None,
-            publisher,
+            publisher: Some(publisher),
         });
     }
     Ok(outcome)
@@ -173,10 +180,11 @@ mod tests {
     fn a_title_without_a_suffix_is_left_alone() {
         let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
         <item><title>Sadə başlıq</title><link>https://news.google.com/rss/articles/x</link>
-        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate></item></channel></rss>"#;
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://www.day.az">Day.Az</source></item></channel></rss>"#;
         let out = parse(xml.as_bytes()).expect("parses");
         assert_eq!(out.items[0].title, "Sadə başlıq");
-        assert_eq!(out.items[0].publisher, None);
+        assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
     }
 
     /// Attribution is keyed on the item's own link, so one item missing a `<source>` cannot
@@ -192,11 +200,13 @@ mod tests {
         <item><title>Üçüncü - APA</title><link>https://news.google.com/rss/articles/3</link>
         <pubDate>Mon, 14 Sep 2026 09:00:00 GMT</pubDate>
         <source url="https://apa.az">APA</source></item></channel></rss>"#;
+        // The unattributed middle item is dropped (C4), and it takes nothing with it:
+        // both neighbours keep their own publishers.
         let out = parse(xml.as_bytes()).expect("parses");
-        assert_eq!(out.items.len(), 3);
+        assert_eq!(out.items.len(), 2);
+        assert_eq!(out.skipped, 1);
         assert_eq!(out.items[0].publisher.as_deref(), Some("Day.Az"));
-        assert_eq!(out.items[1].publisher, None);
-        assert_eq!(out.items[2].publisher.as_deref(), Some("APA"));
+        assert_eq!(out.items[1].publisher.as_deref(), Some("APA"));
     }
 
     /// An item with no link is skipped and counted, and its `<source>` must not leak onto the
@@ -277,5 +287,21 @@ mod tests {
         let out = parse(xml.as_bytes()).expect("parses");
         assert_eq!(out.items[0].publisher.as_deref(), Some("Day & Az"));
         assert_eq!(out.items[0].title, "Bakıda yollar bağlıdır");
+    }
+
+    /// An item with no resolvable publisher cannot contribute to coverage, and crediting
+    /// the synthetic `Google News` outlet is exactly what the central rule forbids.
+    #[test]
+    fn an_unattributed_item_is_skipped_rather_than_credited_to_the_seed() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+        <item><title>Attributed - APA</title><link>https://news.google.com/rss/articles/1</link>
+        <pubDate>Mon, 14 Sep 2026 11:00:00 GMT</pubDate>
+        <source url="https://apa.az">APA</source></item>
+        <item><title>Atsız başlıq</title><link>https://news.google.com/rss/articles/2</link>
+        <pubDate>Mon, 14 Sep 2026 10:00:00 GMT</pubDate></item></channel></rss>"#;
+        let out = parse(xml.as_bytes()).expect("parses");
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.skipped, 1);
+        assert_eq!(out.items[0].publisher.as_deref(), Some("APA"));
     }
 }

@@ -1,6 +1,7 @@
 //! Composition root: resolve paths, open the store, then either run the poller alone
 //! or run the TUI with the poller on its own thread.
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -36,6 +37,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let default_config_path = dirs.as_ref().map(AppDirs::config_path);
 
     if cli.reset_db {
+        if std::io::stdin().is_terminal() {
+            println!(
+                "--reset-db will delete {} and its -wal/-shm sidecars.",
+                db_path.display()
+            );
+            print!("Type y to continue: ");
+            use std::io::Write as _;
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !confirm_reset(&answer) {
+                return Err("aborted: the database was not deleted".into());
+            }
+        }
         reset_database(&db_path)?;
     }
 
@@ -56,7 +71,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.poll_only {
         return run_poller_forever(store, config, now);
     }
-
     // Built here rather than inside the thread: a client that cannot be constructed is a
     // startup failure the user has to see and exit on, not a thread that quietly returns and
     // leaves a TUI that never polls.
@@ -73,10 +87,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
         }
+        // The read loop ended: the TUI would go deaf with no explanation (I12).
+        let _ = input_tx.send(AppEvent::InputFailed("keyboard input failed".into()));
     });
 
-    let poll_tx = tx.clone();
     let interval = Duration::from_secs(config.poll_interval_secs.max(30));
+    let poll_tx = tx.clone();
     let retention_days = config.retention.view_sample_days;
     thread::spawn(move || {
         let mut store = store;
@@ -105,7 +121,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let reader = Store::open(&db_path)?;
+    // Spec §6.2: the UI reads on a read-only connection, so it cannot contend with the
+    // poller's writer for the WAL lock.
+    let reader = Store::open_read_only(&db_path)?;
     let mut app = App::new(reader, config, now);
     let mut terminal = ratatui::init();
     let result = run_tui(&mut terminal, &mut app, &rx, &nudge_tx);
@@ -174,6 +192,11 @@ fn reset_database(db_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Spec §12: an interactive `--reset-db` destroys accumulated history, so it needs an
+/// explicit `y`/`yes`. Extracted so the decision is testable without a terminal.
+fn confirm_reset(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
 /// SQLite names its sidecars `<db>-wal` and `<db>-shm`, by appending rather than by replacing
 /// the extension: `with_extension` would build the wrong path for any database not named `.sqlite`.
 fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -218,13 +241,13 @@ fn run_tui(
         match rx.recv_timeout(TICK) {
             Ok(event) => match app.handle(event) {
                 Action::Quit => return Ok(()),
-                Action::OpenUrl(url) => open_in_browser(&url),
+                Action::OpenUrl(url) => open_in_browser(app, &url),
                 Action::ForcePoll => {
                     let _ = nudge.send(());
                 }
                 Action::None => {}
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => app.tick(chrono::Utc::now().timestamp()),
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
@@ -262,13 +285,22 @@ fn run_poller_forever(
     }
 }
 
-fn open_in_browser(url: &str) {
+/// Open a URL the user selected. Feed and Telegram content is untrusted input, so only
+/// `http://` and `https://` reach the launcher; anything else is refused and named in
+/// the status line (I8). A spawn failure is surfaced the same way.
+fn open_in_browser(app: &mut App, url: &str) {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        app.status = format!("refusing to open a non-http URL: {url}");
+        return;
+    }
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
-    let _ = std::process::Command::new(opener).arg(url).spawn();
+    if let Err(error) = std::process::Command::new(opener).arg(url).spawn() {
+        app.status = format!("browser launch failed: {error}");
+    }
 }
 
 /// Minimal opt-in file logger, matching the sibling project: off by default, truncated
@@ -533,6 +565,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         reset_database(&dir.path().join("bakutrend.sqlite")).unwrap();
+    }
+
+    #[test]
+    fn reset_confirmation_accepts_an_explicit_yes_and_refuses_everything_else() {
+        for answer in ["y", "Y", "yes", "YES", " yes\n"] {
+            assert!(confirm_reset(answer), "{answer:?} must be accepted");
+        }
+        for answer in ["n", "no", "", "\n", "delete", "y yes"] {
+            assert!(!confirm_reset(answer), "{answer:?} must be refused");
+        }
     }
 
     #[test]

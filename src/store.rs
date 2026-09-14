@@ -156,6 +156,12 @@ impl Store {
         Self::prepare(Connection::open_in_memory()?)
     }
 
+    /// Spec §6.2: the UI reads on a read-only connection. No pragmas, no schema batch:
+    /// both are writes, and the poller's `Store::open` has already prepared the database.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn })
+    }
     fn prepare(conn: Connection) -> Result<Self, StoreError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -412,7 +418,7 @@ impl Store {
             "INSERT INTO view_samples (item_id, ts, views)
              SELECT i.id, ?1, i.views
              FROM items i JOIN sources s ON s.id = i.source_id
-             WHERE s.kind = 'telegram' AND i.views IS NOT NULL
+             WHERE s.kind = 'telegram' AND i.views IS NOT NULL AND i.last_seen = ?1
                AND NOT EXISTS (
                  SELECT 1 FROM view_samples v WHERE v.item_id = i.id AND v.ts > ?1 - 600
                )",
@@ -833,9 +839,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.sample_views(now).unwrap(), 1);
-        // Same item, five minutes later: inside the ten-minute throttle, so no new row.
+        // Each later sample needs its own poll first (`last_seen = now`); once the item
+        // has been touched, the ten-minute throttle still applies to it.
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now + 300)
+            .unwrap();
         assert_eq!(store.sample_views(now + 300).unwrap(), 0);
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now + 900)
+            .unwrap();
         assert_eq!(store.sample_views(now + 900).unwrap(), 1);
+    }
+
+    /// Only rows this poll actually touched (`last_seen = now`) may be sampled: a source
+    /// that failed keeps its stale views and must not manufacture a flat velocity.
+    #[test]
+    fn sample_views_only_samples_rows_the_poll_touched() {
+        let (mut store, id) = telegram_fixture();
+        let now = 1_700_000_000;
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now - 3600)
+            .unwrap();
+
+        // No poll at `now`: nothing is sampled.
+        assert_eq!(store.sample_views(now).unwrap(), 0);
+
+        store
+            .upsert_items(id, &[telegram_item("p1", 700, now - 300)], now)
+            .unwrap();
+        assert_eq!(store.sample_views(now).unwrap(), 1);
     }
 
     #[test]
@@ -852,6 +884,47 @@ mod tests {
         assert_eq!(samples[0].views, 500);
     }
 
+    /// Spec §6.2: the UI reads on a read-only connection, so it cannot contend with the
+    /// poller for the write lock.
+    #[test]
+    fn a_read_only_store_can_query_but_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.sqlite");
+        let now = 1_700_000_000;
+        let id = {
+            let mut store = Store::open(&path).unwrap();
+            let id = store
+                .ensure_source(
+                    &SourceSpec {
+                        kind: SourceKind::Telegram,
+                        outlet: "Day.az".to_string(),
+                        name: "Day.az Telegram".to_string(),
+                        locator: "@dayaz".to_string(),
+                    },
+                    true,
+                )
+                .unwrap();
+            store
+                .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now)
+                .unwrap();
+            id
+        };
+
+        let mut reader = Store::open_read_only(&path).unwrap();
+        let (rows, _) = reader.window(Window::Hour, now).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the read-only connection serves window queries"
+        );
+        assert!(
+            reader
+                .upsert_items(id, &[telegram_item("p2", 600, now - 300)], now)
+                .is_err(),
+            "a read-only connection must reject writes"
+        );
+    }
+
     #[test]
     fn prune_removes_only_samples_older_than_the_cutoff() {
         let (mut store, id) = telegram_fixture();
@@ -860,6 +933,9 @@ mod tests {
             .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now)
             .unwrap();
         store.sample_views(now).unwrap();
+        store
+            .upsert_items(id, &[telegram_item("p1", 500, now - 300)], now + 900)
+            .unwrap();
         store.sample_views(now + 900).unwrap();
 
         assert_eq!(store.prune_samples(now + 600).unwrap(), 1);

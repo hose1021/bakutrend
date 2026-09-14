@@ -70,6 +70,11 @@ impl Group {
 
     fn push(&mut self, item: &ItemRow) {
         self.item_ids.push(item.item_id);
+        // `group_items` feeds items oldest first, so this only fires for the public
+        // `assign`; either way the title is the earliest published headline.
+        if item.published_at < self.oldest {
+            self.title = item.title.clone();
+        }
         self.newest = self.newest.max(item.published_at);
         self.oldest = self.oldest.min(item.published_at);
         self.items.push(item.clone());
@@ -242,6 +247,28 @@ mod tests {
             &item(2, 2, "İstinadən: Bakıda bu yollar bağlıdır", 200),
         );
         assert_eq!(groups.len(), 1);
+    }
+
+    /// Public `assign` is called with items in caller order, so the group title must be
+    /// the earliest published headline, not whichever arrived first.
+    #[test]
+    fn assign_titles_the_group_with_the_earliest_published_item() {
+        let clusterer = Clusterer::new(0.45);
+        let mut groups = Vec::new();
+        clusterer.assign(&mut groups, &item(1, 1, "Bakıda bu yollar bağlıdır", 200));
+        clusterer.assign(
+            &mut groups,
+            &item(
+                2,
+                2,
+                "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə",
+                100,
+            ),
+        );
+        assert_eq!(
+            groups[0].title, "Bakıda bu yollar bağlıdır - Sürücülərin nəzərinə",
+            "the earliest published headline names the story"
+        );
     }
 
     #[test]

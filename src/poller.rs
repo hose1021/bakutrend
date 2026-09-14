@@ -45,6 +45,9 @@ impl Backoff {
 pub struct PollReport {
     pub ok: usize,
     pub failed: Vec<(String, String)>,
+    /// Names of sources that succeeded this cycle, so the app can retire them from
+    /// its degraded set (I10). A skipped source appears in neither list.
+    pub succeeded: Vec<String>,
     pub new_items: usize,
     pub samples: usize,
     pub pruned: usize,
@@ -74,6 +77,7 @@ pub fn poll_once(
                 backoff.record_ok(source.id);
                 report.new_items += store.upsert_items(source.id, &outcome.items, now)?;
                 report.skipped += outcome.skipped;
+                report.succeeded.push(source.name.clone());
                 report.ok += 1;
             }
             Err(error) => {
@@ -95,6 +99,7 @@ pub fn poll_once(
             Ok(outcome) => {
                 backoff.record_ok(seed.id);
                 store.upsert_items(seed.id, &outcome.items, now)?;
+                report.skipped += outcome.skipped;
             }
             Err(error) => {
                 backoff.record_failure(seed.id, now);
@@ -353,5 +358,34 @@ mod tests {
             google_calls, 1,
             "google seeds the empty week once, not every cycle"
         );
+    }
+
+    /// The seed's refused items are part of the cycle's accounting too.
+    #[test]
+    fn the_google_seed_reports_its_skipped_items() {
+        struct SkippingSeedFetcher;
+        impl Fetcher for SkippingSeedFetcher {
+            fn fetch(&self, source: &crate::store::SourceRow) -> Result<ParseOutcome, FetchError> {
+                if source.kind == SourceKind::Google {
+                    return Ok(ParseOutcome {
+                        skipped: 2,
+                        ..Default::default()
+                    });
+                }
+                Ok(ParseOutcome::default())
+            }
+        }
+
+        let mut store = store_with_two_sources();
+        google_source(&mut store);
+        let report = poll_once(
+            &mut store,
+            &SkippingSeedFetcher,
+            &mut Backoff::new(),
+            1_700_000_000,
+            30,
+        )
+        .unwrap();
+        assert_eq!(report.skipped, 2);
     }
 }

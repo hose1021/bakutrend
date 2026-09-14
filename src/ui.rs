@@ -23,9 +23,11 @@ pub struct View<'a> {
     pub filter: &'a str,
     pub quiet_fallback: bool,
     pub show_help: bool,
-    pub sources_ok: usize,
+    pub sources_ok: Option<usize>,
     pub sources_total: usize,
     pub last_poll: Option<i64>,
+    /// Sources that failed and have not succeeded again (I10).
+    pub degraded: &'a [String],
     pub now: i64,
     pub status: &'a str,
 }
@@ -75,8 +77,32 @@ pub fn draw(frame: &mut Frame, view: &View<'_>) {
     draw_list(frame, view, areas[1], selected);
     draw_detail(frame, view, areas[2], selected);
     if view.show_help {
-        draw_help(frame, frame.area());
+        draw_help(frame, view, frame.area());
     }
+}
+
+fn draw_help(frame: &mut Frame, view: &View<'_>, area: Rect) {
+    let mut lines: Vec<Line> = HELP_LINES.iter().map(|line| Line::from(*line)).collect();
+    if !view.degraded.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("degraded: {}", view.degraded.join(", ")),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    let width = 56.min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys ")),
+        popup,
+    );
 }
 
 const HELP_LINES: &[&str] = &[
@@ -92,25 +118,12 @@ const HELP_LINES: &[&str] = &[
     "q              quit",
 ];
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let width = 56.min(area.width);
-    let height = (HELP_LINES.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    let lines: Vec<Line> = HELP_LINES.iter().map(|line| Line::from(*line)).collect();
-    frame.render_widget(ratatui::widgets::Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys ")),
-        popup,
-    );
-}
-
 fn draw_header(frame: &mut Frame, view: &View<'_>, area: Rect) {
-    let health = format!("{}/{} sources ok", view.sources_ok, view.sources_total);
+    let health = match view.sources_ok {
+        Some(ok) => format!("{ok}/{} sources ok", view.sources_total),
+        // Health is unknown until a poll reports; claiming 0/0 or N/N would be a lie.
+        None => "sources unknown".to_string(),
+    };
     let polled = view
         .last_poll
         .map(|ts| relative(view.now, ts))
@@ -201,7 +214,7 @@ fn draw_list(frame: &mut Frame, view: &View<'_>, area: Rect, selected: usize) {
 fn quiet_banner(view: &View<'_>) -> Line<'static> {
     Line::from(Span::styled(
         format!(
-            "Quiet hour — showing the latest {} stories instead",
+            "Quiet hour — showing the latest {} stories from the past week",
             view.stories.len()
         ),
         Style::default().fg(Color::Yellow),
@@ -229,9 +242,14 @@ fn draw_detail(frame: &mut Frame, view: &View<'_>, area: Rect, selected: usize) 
         // An empty list is not always good news: a failed poll or database read arrives
         // here as an error in `status`, and saying "still running" over it would hide the
         // one thing the user needs to see.
-        lines.push(Line::from(
-            "No stories yet — the first poll is still running.",
-        ));
+        // Only a run with NO poll yet may claim one is in progress (I5); a polled run
+        // with an empty window says exactly that.
+        let empty_message = if view.last_poll.is_none() {
+            "No stories yet — the first poll is still running."
+        } else {
+            "No stories in this window since the last poll."
+        };
+        lines.push(Line::from(empty_message));
         lines.extend(status_line(view));
         frame.render_widget(Paragraph::new(lines).block(block), area);
         return;
@@ -333,14 +351,15 @@ mod tests {
             stories,
             selected: 0,
             deltas,
-            local_only: false,
+            sources_ok: Some(12),
             filter: "",
+            local_only: false,
             quiet_fallback: false,
             show_help: false,
-            sources_ok: 12,
             sources_total: 20,
             last_poll: Some(0),
             now: 0,
+            degraded: &[],
             status: "",
         }
     }
@@ -401,7 +420,7 @@ mod tests {
         assert!(!screen.contains("No stories yet"), "{screen}");
 
         let empty: Vec<ScoredStory> = Vec::new();
-        assert!(render(&base(&empty, None)).contains("No stories yet"));
+        assert!(render(&base(&empty, None)).contains("No stories"));
     }
 
     #[test]
@@ -410,7 +429,9 @@ mod tests {
         let mut view = base(&empty, None);
         view.status = "database error: disk I/O error";
         let screen = render(&view);
-        assert!(screen.contains("No stories yet"), "{screen}");
+        // `last_poll: Some(0)` means a poll HAS run: the pane must not claim one is
+        // still running (I5). The status still surfaces.
+        assert!(screen.contains("No stories in this window"), "{screen}");
         assert!(
             screen.contains("database error: disk I/O error"),
             "a failure must not hide behind a cheerful empty state:\n{screen}"
