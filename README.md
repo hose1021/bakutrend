@@ -48,10 +48,12 @@ text, `Esc` clears it · `?` toggles help · `r` forces a poll · `q` quits.
 `Home` and `End` mirror `g` and `G`, and in text filter mode `Backspace` deletes one
 character while `Esc` clears the whole filter.
 
-The header reads `n/19 sources ok`. The denominator is the number of enabled sources the
-poller actually polls, not the 20 in the config list: a deliberately disabled source can
-never report a failure, so counting it would leave the header permanently short. The
-Google News seed is excluded for the same reason — it is not a polled source.
+The header reads `n/N sources ok`. N is the number of enabled sources the poller actually
+polls — 19 with the shipped defaults, 20 once `@apatv` is turned back on, and whatever a
+custom `sources` list enables. It is not the 20 in the default config list: a deliberately
+disabled source can never report a failure, so counting it would leave the header
+permanently short. The Google News seed is excluded for the same reason — it is not a
+polled source.
 
 ## How the week window fills in
 
@@ -99,10 +101,13 @@ error rather than a silent run against the defaults.
 
 The default path is the platform config directory, for example
 `~/Library/Application Support/bakutrend/config.toml`. Any key you omit keeps its default.
-A `sources` block replaces the whole default list, so copy it before editing. Top-level
-keys belong before the first `[table]` header: TOML has no way back to the document root,
-so `local_keywords` written after `[retention]` would set `retention.local_keywords` and
-be ignored.
+A `sources` block replaces the whole default list, so copy it before editing. It also
+switches off any source already in the database that it does not name, so the block is the
+only thing that decides what is polled. The one source it cannot replace is the Google News
+seed: that seed is not configurable, is never polled on the normal cycle, and stays enabled
+because the week window is built from it. Top-level keys belong before the first `[table]`
+header: TOML has no way back to the document root, so `local_keywords` written after
+`[retention]` would set `retention.local_keywords` and be ignored.
 
 ```toml
 poll_interval_secs = 300
@@ -145,14 +150,15 @@ clear there.
 
 - Telegram view counts are biased by channel size. Per-channel normalization ranks
   relative buzz within a channel, not absolute reach.
-- Citation detection is lexical. Some reposts will be missed.
+- Citation detection is lexical, over feed articles, Google seeds and Telegram posts alike.
+  Some reposts will be missed.
 - Grouping is lexical, so two outlets describing one event with no shared vocabulary
   remain separate stories.
 - Sources go dark. `haqqin.az` currently answers HTTP 418 to every request regardless of
-  User-Agent, so it reports as degraded: the header counts it as one source short of 19,
-  and it stops contributing new articles until it recovers. It answered normally when the
-  source list was built. A failing source backs off and is retried; it does not fail the
-  cycle.
+  User-Agent, so it reports as degraded: the header counts it as one source short of the
+  enabled total, and it stops contributing new articles until it recovers. It answered
+  normally when the source list was built. A failing source backs off and is retried; it
+  does not fail the cycle.
 - A failed poll does not erase what was already fetched. Articles stored for a source stay
   in every window the source is enabled for, until they age out of the window, even while
   that source is down — only its future polls stop. This is deliberate: a transient network

@@ -5,7 +5,7 @@
 
 use scraper::{Html, Selector};
 
-use crate::source::{section_from_url, ParseOutcome, ParsedItem};
+use crate::source::{is_cited, section_from_url, ParseOutcome, ParsedItem};
 use crate::text::{collapse_ws, decode_entities};
 
 /// Telegram abbreviates view counts: `2.65K`, `1.1K`, `1.2M`, or a plain number, and groups
@@ -86,6 +86,9 @@ pub fn parse(html: &str) -> ParseOutcome {
             .next()
             .and_then(|v| parse_views(&v.text().collect::<String>()));
 
+        // The syndication rule is not limited to article feeds: a channel reposting another
+        // outlet's story is exactly the case it targets.
+        let cited = is_cited(&body);
         outcome.items.push(ParsedItem {
             external_id: post_id.to_string(),
             section: section_from_url(&url),
@@ -94,7 +97,7 @@ pub fn parse(html: &str) -> ParseOutcome {
             description: Some(body),
             published_at,
             views,
-            cited: false,
+            cited,
             publisher: None,
         });
     }
@@ -174,6 +177,33 @@ mod tests {
         assert_eq!(out.items[0].url, "https://t.me/chan/1");
         assert_eq!(out.items[0].views, Some(2650));
         assert_eq!(out.items[1].views, Some(1100));
+    }
+
+    /// One post crediting another outlet, one that credits nobody. Channels repost each other
+    /// constantly, and the syndication rule is not limited to article feeds, so the marker has
+    /// to be read off the post body the parser already extracts.
+    const INLINE_CITATION: &str = r#"<html><body>
+      <div class="tgme_widget_message" data-post="chan/4">
+        <a class="tgme_widget_message_date" href="https://t.me/chan/4">
+          <time datetime="2026-09-13T19:06:15+00:00"></time></a>
+        <div class="tgme_widget_message_text js-message_text" dir="auto">
+          <b>Yanğın söndürülüb</b><br/><br/>“APA”ya istinadən xəbər verir ki, hadisə olub.</div>
+        <span class="tgme_widget_message_views">340</span>
+      </div>
+      <div class="tgme_widget_message" data-post="chan/5">
+        <a class="tgme_widget_message_date" href="https://t.me/chan/5">
+          <time datetime="2026-09-13T20:06:15+00:00"></time></a>
+        <div class="tgme_widget_message_text js-message_text" dir="auto">
+          <b>Sabah hava necə olacaq</b><br/><br/>Bakıda yağış gözlənilir.</div>
+        <span class="tgme_widget_message_views">1.1K</span>
+      </div>
+    </body></html>"#;
+
+    #[test]
+    fn a_post_that_credits_another_outlet_is_cited() {
+        let out = parse(INLINE_CITATION);
+        assert!(out.items[0].cited, "a repost must weigh half in coverage");
+        assert!(!out.items[1].cited, "nothing here credits another outlet");
     }
 
     /// A post whose earlier markup also carries a `<time datetime>` — a link preview or a

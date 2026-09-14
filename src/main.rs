@@ -124,10 +124,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// Register every configured source, and let the config file be the single authority for the
 /// enabled flag. `Store::ensure_source` leaves `enabled` untouched on conflict, so an edit that
 /// turns a source back on would otherwise never reach the row a previous run disabled.
+///
+/// The authority runs the other way too: a row the config does not name was left behind by an
+/// earlier run, and polling it would make a replaced `sources` list look ignored. The Google
+/// seed is exempt — it is not configurable, and `poll_once` never loops over it, so disabling it
+/// would only break the one-shot week seed.
 fn register_sources(store: &mut Store, config: &Config) -> Result<(), StoreError> {
+    let mut configured = Vec::new();
     for (spec, enabled) in config.source_specs() {
         let id = store.ensure_source(&spec, enabled)?;
         store.set_enabled(id, enabled)?;
+        configured.push(spec.locator);
+    }
+    for row in store.sources(false)? {
+        let configurable = matches!(row.kind, SourceKind::Rss | SourceKind::Telegram);
+        if configurable && !configured.contains(&row.locator) {
+            store.set_enabled(row.id, false)?;
+        }
     }
     Ok(())
 }
@@ -327,6 +340,57 @@ mod tests {
         let polled = store.sources(true).unwrap();
         assert_eq!(polled.len(), 1, "the config turns the source back on");
         assert_eq!(polled[0].locator, "@apatv");
+    }
+
+    /// A database initialised from the defaults keeps every row it had. A config that names
+    /// only one source must therefore switch the others off, or replacing the list changes
+    /// nothing for a user who already ran the program once. The Google seed is not in the
+    /// configurable list and is not polled per cycle, so it stays on.
+    #[test]
+    fn a_config_that_omits_a_source_disables_that_row() {
+        let mut store = Store::open_in_memory().unwrap();
+        let channel = |outlet: &str, locator: &str| SourceSpec {
+            kind: SourceKind::Telegram,
+            outlet: outlet.to_string(),
+            name: format!("{outlet} Telegram"),
+            locator: locator.to_string(),
+        };
+        store.ensure_source(&channel("APA", "@apa_az"), true).unwrap();
+        store.ensure_source(&channel("Day.az", "@dayaz"), true).unwrap();
+        store
+            .ensure_source(
+                &SourceSpec {
+                    kind: SourceKind::Google,
+                    outlet: "Google News".to_string(),
+                    name: "Google News 7d".to_string(),
+                    locator: "google:7d".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.sources = vec![SourceConfig {
+            name: "APA Telegram".to_string(),
+            kind: "telegram".to_string(),
+            locator: "@apa_az".to_string(),
+            outlet: "APA".to_string(),
+            enabled: true,
+        }];
+
+        register_sources(&mut store, &config).unwrap();
+
+        let polled: Vec<String> = store
+            .sources(true)
+            .unwrap()
+            .iter()
+            .map(|row| row.locator.clone())
+            .collect();
+        assert_eq!(
+            polled,
+            ["@apa_az", "google:7d"],
+            "config decides which rows are polled; the google seed is exempt"
+        );
     }
 
     #[test]
