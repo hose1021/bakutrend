@@ -1,6 +1,7 @@
 //! Composition root: resolve paths, open the store, then either run the poller alone
 //! or run the TUI with the poller on its own thread.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use bakutrend::app::{Action, App, AppEvent};
 use bakutrend::cli::Cli;
 use bakutrend::config::Config;
 use bakutrend::dirs::AppDirs;
+use bakutrend::error::{ConfigError, StoreError};
 use bakutrend::poller::{Backoff, poll_once};
 use bakutrend::source::http::HttpFetcher;
 use bakutrend::source::{SourceKind, SourceSpec};
@@ -31,36 +33,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map(AppDirs::db_path)
         .unwrap_or_else(|| "bakutrend.sqlite".into());
-    let config_path = cli
-        .config
-        .clone()
-        .or_else(|| dirs.as_ref().map(AppDirs::config_path));
+    let default_config_path = dirs.as_ref().map(AppDirs::config_path);
 
-    if cli.reset_db && db_path.exists() {
-        std::fs::remove_file(&db_path)?;
-        let _ = std::fs::remove_file(db_path.with_extension("sqlite-wal"));
-        let _ = std::fs::remove_file(db_path.with_extension("sqlite-shm"));
+    if cli.reset_db {
+        reset_database(&db_path)?;
     }
 
-    let config = match config_path.as_deref() {
-        Some(path) if path.exists() => Config::load(path)?,
-        _ => Config::default(),
-    };
+    let config = resolve_config(cli.config.as_deref(), default_config_path.as_deref())?;
 
     if let (Some(level), Some(dirs)) = (cli.log.as_deref(), dirs.as_ref()) {
         init_file_logger(level, &dirs.log_path());
     }
 
     let mut store = Store::open(&db_path)?;
-    for (spec, enabled) in config.source_specs() {
-        store.ensure_source(&spec, enabled)?;
-        if !enabled {
-            let rows = store.sources(false)?;
-            if let Some(row) = rows.iter().find(|r| r.locator == spec.locator) {
-                store.set_enabled(row.id, false)?;
-            }
-        }
-    }
+    register_sources(&mut store, &config)?;
 
     // The Google source exists only to seed the week window once. It is created here
     // because it is deliberately absent from the user's configurable source list.
@@ -79,6 +65,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return run_poller_forever(store, config, now);
     }
 
+    // Built here rather than inside the thread: a client that cannot be constructed is a
+    // startup failure the user has to see and exit on, not a thread that quietly returns and
+    // leaves a TUI that never polls.
+    let fetcher = HttpFetcher::new("azerbaycan OR baki OR bakı")?;
+
     let (tx, rx) = mpsc::channel::<AppEvent>();
     // Pressing `r` nudges the poller rather than waiting out the interval.
     let (nudge_tx, nudge_rx) = mpsc::channel::<()>();
@@ -96,13 +87,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let interval = Duration::from_secs(config.poll_interval_secs.max(30));
     let retention_days = config.retention.view_sample_days;
     thread::spawn(move || {
-        let fetcher = match HttpFetcher::new("azerbaycan OR baki OR bakı") {
-            Ok(fetcher) => fetcher,
-            Err(error) => {
-                let _ = poll_tx.send(AppEvent::PollFailed(error.to_string()));
-                return;
-            }
-        };
         let mut store = store;
         let mut backoff = Backoff::new();
         loop {
@@ -135,6 +119,57 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let result = run_tui(&mut terminal, &mut app, &rx, &nudge_tx);
     ratatui::restore();
     result
+}
+
+/// Register every configured source, and let the config file be the single authority for the
+/// enabled flag. `Store::ensure_source` leaves `enabled` untouched on conflict, so an edit that
+/// turns a source back on would otherwise never reach the row a previous run disabled.
+fn register_sources(store: &mut Store, config: &Config) -> Result<(), StoreError> {
+    for (spec, enabled) in config.source_specs() {
+        let id = store.ensure_source(&spec, enabled)?;
+        store.set_enabled(id, enabled)?;
+    }
+    Ok(())
+}
+
+/// Delete the database and the write-ahead log sidecars SQLite keeps beside it. Every path is
+/// removed unconditionally: a sidecar left behind by an earlier run is recovered against the
+/// freshly created database, which is the corruption `--reset-db` exists to prevent. A path
+/// that is already absent is success, so a reset on a pristine install still works.
+fn reset_database(db_path: &Path) -> std::io::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let path = sidecar_path(db_path, suffix);
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// SQLite names its sidecars `<db>-wal` and `<db>-shm`, by appending rather than by replacing
+/// the extension: `with_extension` would build the wrong path for any database not named `.sqlite`.
+fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Resolve the configuration, distinguishing the two reasons a path can be missing. A file the
+/// user named with `--config` is loaded whatever it says, so a typo is an error rather than a
+/// silent run against the built-in source list. Only the platform default may fall back to
+/// [`Config::default`], which is the "no config file written yet" case.
+fn resolve_config(
+    explicit: Option<&Path>,
+    default_path: Option<&Path>,
+) -> Result<Config, ConfigError> {
+    match explicit {
+        Some(path) => Config::load(path),
+        None => match default_path {
+            Some(path) if path.exists() => Config::load(path),
+            _ => Ok(Config::default()),
+        },
+    }
 }
 
 fn run_tui(
@@ -235,20 +270,145 @@ fn init_file_logger(level: &str, path: &std::path::Path) {
         "error" => log::LevelFilter::Error,
         _ => log::LevelFilter::Debug,
     };
-    // The log lives in the state directory, which may not exist on a first run; without
-    // this `File::create` fails and the requested log is silently dropped.
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    // The log lives in the state directory, which may not exist on a first run. A file logger
+    // that cannot be installed is worth saying out loud — the user asked for logging and would
+    // otherwise get none — but it is never fatal.
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "Warning: cannot create log directory {}: {error}",
+            parent.display()
+        );
     }
-    if let Ok(file) = std::fs::File::create(path) {
-        // `set_logger` wants `&'static`, so the logger lives in a `OnceLock` rather than
-        // leaking a box.
-        static LOGGER: std::sync::OnceLock<FileLogger> = std::sync::OnceLock::new();
-        let _ = LOGGER.set(FileLogger(std::sync::Mutex::new(file)));
-        if let Some(logger) = LOGGER.get()
-            && log::set_logger(logger).is_ok()
-        {
-            log::set_max_level(parsed);
+    let file = match std::fs::File::create(path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("Warning: cannot open log file {}: {error}", path.display());
+            return;
         }
+    };
+    static LOGGER: std::sync::OnceLock<FileLogger> = std::sync::OnceLock::new();
+    let logger = LOGGER.get_or_init(|| FileLogger(std::sync::Mutex::new(file)));
+    match log::set_logger(logger) {
+        Ok(()) => log::set_max_level(parsed),
+        Err(error) => eprintln!("Warning: cannot install the file logger: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bakutrend::config::SourceConfig;
+    use std::fs;
+
+    #[test]
+    fn re_registering_applies_the_config_enabled_flag_in_both_directions() {
+        let mut store = Store::open_in_memory().unwrap();
+        let source = |enabled: bool| SourceConfig {
+            name: "APATV Telegram".to_string(),
+            kind: "telegram".to_string(),
+            locator: "@apatv".to_string(),
+            outlet: "APATV".to_string(),
+            enabled,
+        };
+        let mut config = Config::default();
+        config.sources = vec![source(false)];
+
+        register_sources(&mut store, &config).unwrap();
+        assert!(
+            store.sources(true).unwrap().is_empty(),
+            "a disabled source is not polled"
+        );
+
+        config.sources = vec![source(true)];
+        register_sources(&mut store, &config).unwrap();
+
+        let polled = store.sources(true).unwrap();
+        assert_eq!(polled.len(), 1, "the config turns the source back on");
+        assert_eq!(polled[0].locator, "@apatv");
+    }
+
+    #[test]
+    fn reset_database_removes_the_database_and_both_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bakutrend.sqlite");
+        let paths = ["", "-wal", "-shm"].map(|suffix| sidecar_path(&db_path, suffix));
+        for path in &paths {
+            fs::write(path, b"stale").unwrap();
+        }
+
+        reset_database(&db_path).unwrap();
+
+        for path in &paths {
+            assert!(!path.exists(), "{} survived the reset", path.display());
+        }
+    }
+
+    #[test]
+    fn reset_database_removes_a_stale_wal_without_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bakutrend.sqlite");
+        let wal = sidecar_path(&db_path, "-wal");
+        fs::write(&wal, b"stale").unwrap();
+
+        reset_database(&db_path).unwrap();
+
+        assert!(
+            !wal.exists(),
+            "a stale wal would be recovered against the next database"
+        );
+    }
+
+    #[test]
+    fn reset_database_succeeds_when_nothing_exists() {
+        let dir = tempfile::tempdir().unwrap();
+
+        reset_database(&dir.path().join("bakutrend.sqlite")).unwrap();
+    }
+
+    #[test]
+    fn an_explicit_config_path_that_does_not_exist_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("bakutrend.toml");
+
+        let result = resolve_config(Some(&missing), None);
+
+        assert!(
+            result.is_err(),
+            "a named config must not silently fall back to the built-in list"
+        );
+    }
+
+    #[test]
+    fn an_explicit_config_path_is_loaded_rather_than_defaulted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mine.toml");
+        fs::write(&path, "poll_interval_secs = 42\n").unwrap();
+
+        let config = resolve_config(Some(&path), None).unwrap();
+
+        assert_eq!(config.poll_interval_secs, 42);
+    }
+
+    #[test]
+    fn a_missing_default_config_path_yields_the_built_in_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("config.toml");
+
+        let config = resolve_config(None, Some(&absent)).unwrap();
+
+        assert_eq!(config.sources.len(), Config::default().sources.len());
+    }
+
+    #[test]
+    fn an_existing_default_config_path_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "poll_interval_secs = 77\n").unwrap();
+
+        let config = resolve_config(None, Some(&path)).unwrap();
+
+        assert_eq!(config.poll_interval_secs, 77);
     }
 }
