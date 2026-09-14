@@ -8,13 +8,18 @@ events by popularity in the last hour, the last day, or the last week. The one d
 `@apatv`, which began returning a preview-less stub with no post text; turn it back on in the
 config when it serves posts again.
 
-Popularity combines two signals:
+Popularity combines three inputs — two measures of reader interest, plus a decay for age:
 
 - **Cross-outlet coverage** — how many independent outlets carry the story. Reposts that
   credit another outlet weigh half, and one outlet publishing both a feed and a channel
   still casts a single vote.
 - **Reader engagement** — Telegram view counts, normalized per channel so a large channel's
   routine post does not outrank a small channel's breakout post.
+- **Freshness** — a story decays as it ages inside the selected window, so an old story does
+  not hold the top slot on coverage and views alone.
+
+The three combine as `0.40 × coverage + 0.40 × engagement + 0.20 × freshness` by default;
+the weights are configurable.
 
 Press `Enter` on any story to see every outlet carrying it, each with its timestamp and
 view count, plus the coverage / engagement / freshness breakdown behind its score.
@@ -39,6 +44,9 @@ bakutrend --reset-db      # delete and rebuild the database
 Keys: `1` `2` `3` or `Tab` switch window · `j` `k` or arrows move · `g` `G` jump to
 top/bottom · `Enter` opens the article · `l` toggles the local filter · `/` filters by
 text, `Esc` clears it · `?` toggles help · `r` forces a poll · `q` quits.
+
+`Home` and `End` mirror `g` and `G`, and in text filter mode `Backspace` deletes one
+character while `Esc` clears the whole filter.
 
 The header reads `n/19 sources ok`. The denominator is the number of enabled sources the
 poller actually polls, not the 20 in the config list: a deliberately disabled source can
@@ -91,11 +99,15 @@ error rather than a silent run against the defaults.
 
 The default path is the platform config directory, for example
 `~/Library/Application Support/bakutrend/config.toml`. Any key you omit keeps its default.
-A `sources` block replaces the whole default list, so copy it before editing.
+A `sources` block replaces the whole default list, so copy it before editing. Top-level
+keys belong before the first `[table]` header: TOML has no way back to the document root,
+so `local_keywords` written after `[retention]` would set `retention.local_keywords` and
+be ignored.
 
 ```toml
 poll_interval_secs = 300
 cluster_threshold  = 0.45
+local_keywords     = ["Bakı", "Gəncə", "Qarabağ", "Azərbaycan"]
 
 [weights]
 coverage   = 0.40
@@ -104,8 +116,6 @@ freshness  = 0.20
 
 [retention]
 view_sample_days = 30
-
-local_keywords = ["Bakı", "Gəncə", "Qarabağ", "Azərbaycan"]
 
 [[sources]]
 name    = "Qafqazinfo RSS"
@@ -140,6 +150,12 @@ clear there.
   remain separate stories.
 - Sources go dark. `haqqin.az` currently answers HTTP 418 to every request regardless of
   User-Agent, so it reports as degraded: the header counts it as one source short of 19,
-  and it contributes no articles until it recovers. It answered normally when the source
-  list was built. A failing source backs off and is retried; it does not fail the cycle.
+  and it stops contributing new articles until it recovers. It answered normally when the
+  source list was built. A failing source backs off and is retried; it does not fail the
+  cycle.
+- A failed poll does not erase what was already fetched. Articles stored for a source stay
+  in every window the source is enabled for, until they age out of the window, even while
+  that source is down — only its future polls stop. This is deliberate: a transient network
+  error must not silently delete data. If a dead source keeps appearing in ranked stories,
+  that is why.
 - The local filter is a keyword heuristic, not a geocoder.
