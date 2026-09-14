@@ -3944,10 +3944,26 @@ Add to `src/lib.rs`:
 pub mod ui;
 ```
 
+**Shipped shape (post-review).** Four corrections to the `ui.rs` snippet above, all user-visible:
+
+- `window_tabs` takes only the active window and renders `1h  24h  7d` with NO counts. The counts
+  array above filtered the same `view.stories` slice by `view.window`, so only the active window
+  could ever be non-zero — the header read `1h (0) 24h (5) 7d (0)`, asserting the 7-day window was
+  empty. The spec's own mockup has no counts; they were an addition, not a requirement.
+- The selection is clamped ONCE at the top of `draw`, and that single value feeds both the table
+  state and the detail pane. Clamping only the table made a shrunken list highlight its last row
+  while the pane announced there were no stories — two halves of the screen disagreeing.
+- The empty-stories branch renders `view.status` when it is non-empty, plus the quiet banner. It
+  previously printed only "the first poll is still running", so a database or poller error was
+  presented as a cheerful wait.
+- The long-headline test asserts that the headline's opening renders, its tail does NOT, and every
+  line's `unicode_width` fits the frame. The original asserted width ≤ 100 on rows chunked from a
+  100-column buffer, which cannot fail.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --lib ui:: 2>&1 | tail -30`
-Expected: PASS, 5 tests.
+Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
 
